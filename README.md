@@ -18,10 +18,26 @@ Options:
   -h, --help               Show this help
 
 Commands:
+  completions             Print shell completion script to stdout
   help                    Show global or command-specific help
   ls, list                List cached models and artifacts
   rm, remove              Remove MODEL or MODEL:QUANT from the cache
 ```
+
+### Shell Completions
+
+Print completion scripts to stdout:
+
+Examples:
+
+```text
+source <(llama-cache-manager completions bash)
+llama-cache-manager completions zsh > ~/.zfunc/_llama-cache-manager
+llama-cache-manager completions fish > ~/.config/fish/completions/llama-cache-manager.fish
+```
+
+The repository also contains the raw completion files under
+[`completions/`](./completions).
 
 ### Examples
 
@@ -29,6 +45,7 @@ Commands:
 llama-cache-manager ls
 llama-cache-manager ls unsloth
 llama-cache-manager ls :UD-Q4_K_XL
+llama-cache-manager completions bash
 llama-cache-manager rm -f unsloth/gpt-oss-20b-GGUF
 llama-cache-manager remove --dry-run unsloth/Qwen3.5-9B-GGUF:Q4_K_XL
 llama-cache-manager -c /srv/llama-models list

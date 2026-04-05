@@ -1,0 +1,93 @@
+#compdef llama-cache-manager
+
+_llama_cache_manager() {
+	local curcontext="$curcontext" state line cmd
+	local -i i skip_next
+	local -a global_opts commands rm_opts
+
+	global_opts=(
+		'-c[cache root]:directory:_files -/'
+		'--cache-dir[cache root]:directory:_files -/'
+		'-h[show help]'
+		'--help[show help]'
+	)
+
+	commands=(
+		'help:show global or command-specific help'
+		'ls:list cached models and artifacts'
+		'list:list cached models and artifacts'
+		'rm:remove MODEL or MODEL:QUANT from the cache'
+		'remove:remove MODEL or MODEL:QUANT from the cache'
+	)
+
+	rm_opts=(
+		'-n[print actions without deleting]'
+		'--dry-run[print actions without deleting]'
+		'-f[delete without confirmation]'
+		'--force[delete without confirmation]'
+		'-h[show help]'
+		'--help[show help]'
+	)
+
+	cmd=""
+	skip_next=0
+	for (( i = 2; i < CURRENT; i++ )); do
+		if (( skip_next )); then
+			skip_next=0
+			continue
+		fi
+
+		case "${words[i]}" in
+			-c|--cache-dir)
+				skip_next=1
+				;;
+			help|ls|list|rm|remove)
+				cmd="${words[i]}"
+				break
+				;;
+		esac
+	done
+
+	if [[ "${words[CURRENT-1]}" == "-c" || "${words[CURRENT-1]}" == "--cache-dir" ]]; then
+		_files -/
+		return
+	fi
+
+	if [[ -z "$cmd" && ${words[CURRENT]} == -* ]]; then
+		_arguments -s $global_opts
+		return
+	fi
+
+	case "$cmd" in
+	help)
+		_arguments '2:command:(help ls list rm remove)'
+		;;
+	ls|list)
+		if [[ ${words[CURRENT]} == -* ]]; then
+			_arguments '-h[show help]' '--help[show help]'
+		else
+			compadd -- ${(f)"$(${words[1]} __complete filters 2>/dev/null)"}
+		fi
+		;;
+	rm|remove)
+		if [[ ${words[CURRENT]} == -* ]]; then
+			_arguments -s $rm_opts
+		else
+			compadd -- ${(f)"$(${words[1]} __complete rm 2>/dev/null)"}
+		fi
+		;;
+	"" )
+		_arguments -s $global_opts '1:command:->command'
+		case "$state" in
+			command)
+				_describe -t commands 'command' commands
+				;;
+		esac
+		;;
+	*)
+		_arguments -s $global_opts '1:command:->command'
+		;;
+	esac
+}
+
+_llama_cache_manager "$@"

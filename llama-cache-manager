@@ -3,6 +3,19 @@
 set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
+
+resolve_script_path() {
+	local source_path="${BASH_SOURCE[0]:-$0}"
+
+	if command -v realpath >/dev/null 2>&1; then
+		realpath "$source_path"
+	else
+		readlink -f "$source_path"
+	fi
+}
+
+SCRIPT_PATH="$(resolve_script_path)"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 DEFAULT_CACHE_DIR="${LLAMA_CACHE:-${HF_HOME:-$HOME/.cache}/llama.cpp}"
 DEFAULT_CACHE_FALLBACK="${HF_HOME:-$HOME/.cache}/llama.cpp"
 DEFAULT_CACHE_HELP_FALLBACK="${DEFAULT_CACHE_FALLBACK/#$HOME/\~}"
@@ -67,6 +80,7 @@ Options:
   -h, --help               Show this help
 
 Commands:
+  completions             Print shell completion script to stdout
   help                    Show global or command-specific help
   ls, list                List cached models and artifacts
   rm, remove              Remove MODEL or MODEL:QUANT from the cache
@@ -90,6 +104,20 @@ Usage:
 Options:
   -n, --dry-run            Print actions without deleting
   -f, --force              Delete without confirmation
+EOF
+}
+
+usage_completions() {
+	cat <<EOF
+Usage:
+  $SCRIPT_NAME completions {bash|zsh|fish}
+EOF
+}
+
+usage_complete() {
+	cat <<EOF
+Usage:
+  $SCRIPT_NAME __complete {commands|rm|filters}
 EOF
 }
 
@@ -350,6 +378,97 @@ matches_filters() {
 	done
 
 	return 1
+}
+
+complete_commands() {
+	printf '%s\n' help ls list rm remove
+}
+
+complete_refs() {
+	local mode="$1"
+	local model_dir snapshot_dir model_ref org_ref
+	local entry_path entry_name label
+
+	while read -r model_dir; do
+		snapshot_dir="$model_dir/snapshots"
+		[ -d "$snapshot_dir" ] || continue
+		model_ref="$(display_model_ref "$(basename "$model_dir")")"
+		org_ref="${model_ref%%/*}"
+
+		case "$mode" in
+		filters)
+			printf '%s\n' "$org_ref"
+			printf '%s\n' "$model_ref"
+			;;
+		rm)
+			printf '%s\n' "$model_ref"
+			;;
+		esac
+
+		while read -r entry_path; do
+			entry_name="$(basename "$entry_path")"
+			label="$(artifact_label "$model_ref" "$entry_name")"
+
+			case "$label" in
+			*" "*) continue ;;
+			esac
+
+			case "$mode" in
+			filters)
+				printf ':%s\n' "$label"
+				printf '%s:%s\n' "$model_ref" "$label"
+				;;
+			rm)
+				printf '%s:%s\n' "$model_ref" "$label"
+				;;
+			esac
+		done < <(find "$snapshot_dir" -mindepth 2 -maxdepth 2 -type l -name '*.gguf' | sort)
+	done < <(find "$CACHE_DIR" -mindepth 1 -maxdepth 1 -type d -name 'models--*' | sort)
+}
+
+run_complete() {
+	local mode="${1:-}"
+
+	case "$mode" in
+	commands)
+		complete_commands | sort -u
+		;;
+	rm)
+		complete_refs rm | sort -u
+		;;
+	filters)
+		complete_refs filters | sort -u
+		;;
+	-h|--help|"")
+		usage_complete
+		;;
+	*)
+		die "unknown completion mode: $mode"
+		;;
+	esac
+}
+
+print_completion_script() {
+	local shell_name="$1"
+	local path
+
+	case "$shell_name" in
+	bash)
+		path="$SCRIPT_DIR/completions/llama-cache-manager.bash"
+		;;
+	zsh)
+		path="$SCRIPT_DIR/completions/_llama-cache-manager"
+		;;
+	fish)
+		path="$SCRIPT_DIR/completions/llama-cache-manager.fish"
+		;;
+	*)
+		die "unknown shell: $shell_name"
+		;;
+	esac
+
+	[ -f "$path" ] || die "completion script not found: $path"
+	cat -- "$path"
 }
 
 list_models() {
@@ -624,10 +743,18 @@ done
 }
 
 case "$1" in
+__complete)
+	shift
+	[ "$#" -eq 1 ] || die "__complete requires MODE"
+	run_complete "$1"
+	;;
 help)
 	case "${2:-}" in
 	"" | -h | --help)
 		usage
+		;;
+	completions)
+		usage_completions
 		;;
 	ls | list)
 		usage_list
@@ -637,6 +764,21 @@ help)
 		;;
 	*)
 		die "unknown command: $2"
+		;;
+	esac
+	;;
+completions)
+	shift
+	case "${1:-}" in
+	bash | zsh | fish)
+		[ "$#" -eq 1 ] || die "completions requires SHELL"
+		print_completion_script "$1"
+		;;
+	-h | --help | "")
+		usage_completions
+		;;
+	*)
+		die "unknown shell: $1"
 		;;
 	esac
 	;;
