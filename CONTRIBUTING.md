@@ -18,13 +18,12 @@
 
 At minimum, check:
 
-- `bash -n ./llama-cache-manager.sh`
-- `./llama-cache-manager.sh --help`
-- `./llama-cache-manager.sh list --help`
-- `./llama-cache-manager.sh rm --help`
-- `./llama-cache-manager.sh -n rm ...` is not valid
-- `./llama-cache-manager.sh rm -n ...` works
-- `./llama-cache-manager.sh list` against a real cache
-- `./llama-cache-manager.sh rm -n MODEL`
-- `./llama-cache-manager.sh rm -n MODEL:QUANT`
-
+- `bash -n ./llama-cache-manager`
+- `./llama-cache-manager --help`
+- `./llama-cache-manager list --help`
+- `./llama-cache-manager rm --help`
+- `./llama-cache-manager -n rm ...` is not valid
+- `./llama-cache-manager rm -n ...` works
+- `./llama-cache-manager list` against a real cache
+- `./llama-cache-manager rm -n MODEL`
+- `./llama-cache-manager rm -n MODEL:QUANT`

@@ -11,7 +11,7 @@ It uses the same model reference format as llama.cpp's `-hf` option:
 
 ```text
 Usage:
-  llama-cache-manager.sh [OPTIONS] <command>
+  llama-cache-manager [OPTIONS] <command>
 
 Options:
   -c DIR, --cache-dir DIR  Cache root. Default: LLAMA_CACHE or ~/.cache/llama.cpp
@@ -26,13 +26,13 @@ Commands:
 ### Examples
 
 ```text
-llama-cache-manager.sh ls
-llama-cache-manager.sh ls unsloth
-llama-cache-manager.sh ls :UD-Q4_K_XL
-llama-cache-manager.sh rm -f unsloth/gpt-oss-20b-GGUF
-llama-cache-manager.sh remove --dry-run unsloth/Qwen3.5-9B-GGUF:Q4_K_XL
-llama-cache-manager.sh -c /srv/llama-models list
-llama-cache-manager.sh help rm
+llama-cache-manager ls
+llama-cache-manager ls unsloth
+llama-cache-manager ls :UD-Q4_K_XL
+llama-cache-manager rm -f unsloth/gpt-oss-20b-GGUF
+llama-cache-manager remove --dry-run unsloth/Qwen3.5-9B-GGUF:Q4_K_XL
+llama-cache-manager -c /srv/llama-models list
+llama-cache-manager help rm
 ```
 
 ### Color
@@ -94,7 +94,7 @@ Cache root resolution:
 - Quant detection is filename-based and currently assumes names
   like `...-Q4_K_XL.gguf` or `...-BF16.gguf`.
 - If naming conventions change, the parsing logic in
-  [`llama-cache-manager.sh`](./llama-cache-manager.sh) will
+  [`llama-cache-manager`](./llama-cache-manager) will
   need to be updated.
 - If multiple snapshots of the same model are present,
   blob deletion remains reference-aware within that model
