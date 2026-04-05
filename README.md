@@ -27,6 +27,8 @@ Commands:
 
 ```text
 llama-cache-manager.sh ls
+llama-cache-manager.sh ls unsloth
+llama-cache-manager.sh ls :UD-Q4_K_XL
 llama-cache-manager.sh rm -f unsloth/gpt-oss-20b-GGUF
 llama-cache-manager.sh remove --dry-run unsloth/Qwen3.5-9B-GGUF:Q4_K_XL
 llama-cache-manager.sh -c /srv/llama-models list
@@ -43,6 +45,16 @@ Supported remove targets:
 
 - `rm MODEL`: Removes the whole model with all quants
 - `rm MODEL:QUANT`: Removes a single quant
+
+### List Filters
+
+`ls` accepts optional filters.
+
+- plain text matches against `org/repo`
+- `:QUANT` matches against quant labels
+- `org/repo:QUANT` matches the full reference
+
+Multiple filters are combined with OR.
 
 ## Technical Notes
 ### Cache Layout

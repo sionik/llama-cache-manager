@@ -76,7 +76,7 @@ EOF
 usage_list() {
 	cat <<EOF
 Usage:
-  $SCRIPT_NAME {ls|list}
+  $SCRIPT_NAME {ls|list} [FILTER...]
 
 List cached models grouped by model, with artifact sizes and total size.
 EOF
@@ -297,7 +297,63 @@ artifact_sort_key() {
 	esac
 }
 
+contains_ci() {
+	local haystack="$1"
+	local needle="$2"
+
+	haystack="$(printf '%s' "$haystack" | tr '[:upper:]' '[:lower:]')"
+	needle="$(printf '%s' "$needle" | tr '[:upper:]' '[:lower:]')"
+
+	case "$haystack" in
+	*"$needle"*)
+		return 0
+		;;
+	*)
+		return 1
+		;;
+	esac
+}
+
+matches_filter() {
+	local model_ref="$1"
+	local label="$2"
+	local filter="$3"
+	local full_ref="${model_ref}:${label}"
+
+	case "$filter" in
+	:*)
+		contains_ci "$label" "${filter#:}"
+		;;
+	*:*)
+		contains_ci "$full_ref" "$filter"
+		;;
+	*)
+		contains_ci "$model_ref" "$filter"
+		;;
+	esac
+}
+
+matches_filters() {
+	local model_ref="$1"
+	local label="$2"
+	local filter
+
+	if [ "$#" -eq 2 ]; then
+		return 0
+	fi
+
+	shift 2
+	for filter in "$@"; do
+		if matches_filter "$model_ref" "$label" "$filter"; then
+			return 0
+		fi
+	done
+
+	return 1
+}
+
 list_models() {
+	local -a filters
 	local model_dir snapshot_dir model_ref
 	local entry_name entry_path blob_path size_bytes size_h label
 	local model_total_bytes total_h
@@ -309,7 +365,9 @@ list_models() {
 	local -a model_artifact_label model_artifact_size model_artifact_sort
 	local row_count=0
 	local model_artifact_count
+	local matched_count
 
+	filters=("$@")
 	max_width=0
 
 	while read -r model_dir; do
@@ -318,6 +376,7 @@ list_models() {
 		model_ref="$(display_model_ref "$(basename "$model_dir")")"
 		model_total_bytes=0
 		model_artifact_count=0
+		matched_count=0
 
 		label_width="$(string_length "$model_ref")"
 		if [ "$label_width" -gt "$max_width" ]; then
@@ -329,8 +388,13 @@ list_models() {
 			blob_path="$(resolve_path "$entry_path")"
 			size_bytes="$(file_size_bytes "$blob_path")"
 			size_h="$(human_size "$size_bytes")"
-			model_total_bytes=$((model_total_bytes + size_bytes))
 			label="$(artifact_label "$model_ref" "$entry_name")"
+			if ! matches_filters "$model_ref" "$label" "${filters[@]}"; then
+				continue
+			fi
+
+			model_total_bytes=$((model_total_bytes + size_bytes))
+			matched_count=$((matched_count + 1))
 			artifact_text="  - $label"
 			label_width="$(string_length "$artifact_text")"
 			if [ "$label_width" -gt "$max_width" ]; then
@@ -341,6 +405,8 @@ list_models() {
 			model_artifact_sort[$model_artifact_count]="$(artifact_sort_key "$label")"
 			model_artifact_count=$((model_artifact_count + 1))
 		done < <(find "$snapshot_dir" -mindepth 2 -maxdepth 2 -type l -name '*.gguf' | sort)
+
+		[ "$matched_count" -gt 0 ] || continue
 
 		total_h="$(human_size "$model_total_bytes")"
 		row_kind[$row_count]="M"
@@ -368,6 +434,8 @@ list_models() {
 		row_size[$row_count]=""
 		row_count=$((row_count + 1))
 	done < <(find "$CACHE_DIR" -mindepth 1 -maxdepth 1 -type d -name 'models--*' | sort)
+
+	[ "$row_count" -gt 0 ] || return 0
 
 	local i kind field1 field2
 	for ((i = 0; i < ${#row_kind[@]}; i++)); do
@@ -575,14 +643,16 @@ help)
 ls | list)
 	case "${2:-}" in
 	"")
-		list_models
+		shift
+		list_models "$@"
 		;;
 	-h | --help)
 		[ "$#" -eq 2 ] || die "list --help takes no additional arguments"
 		usage_list
 		;;
 	*)
-		die "list takes no additional arguments"
+		shift
+		list_models "$@"
 		;;
 	esac
 	;;
