@@ -220,11 +220,42 @@ split_model_quant_ref() {
 	printf '%s\n%s\n' "$model_part" "$quant_part"
 }
 
+model_base_name() {
+	local model="$1"
+	local display_ref repo_name
+
+	display_ref="$(display_model_ref "$model")"
+	repo_name="${display_ref#*/}"
+	printf '%s\n' "${repo_name%-GGUF}"
+}
+
+extract_quant_label() {
+	local model="$1"
+	local file_name="$2"
+	local base_name="${2%.gguf}"
+	local model_base
+
+	model_base="$(model_base_name "$model")"
+
+	case "$base_name" in
+	mmproj-*)
+		printf '%s\n' "${base_name#mmproj-}"
+		;;
+	"$model_base"-*)
+		printf '%s\n' "${base_name#"$model_base"-}"
+		;;
+	*)
+		printf '%s\n' "-"
+		;;
+	esac
+}
+
 artifact_label() {
-	local file_name="$1"
+	local model="$1"
+	local file_name="$2"
 	local quant
 
-	quant="$(printf '%s\n' "$file_name" | sed -E 's/.*-((IQ|Q|BF)[A-Z0-9_]+)\.gguf$/\1/; t; s/^.*$/-/')"
+	quant="$(extract_quant_label "$model" "$file_name")"
 
 	case "$file_name" in
 	mmproj-*.gguf)
@@ -299,7 +330,7 @@ list_models() {
 			size_bytes="$(file_size_bytes "$blob_path")"
 			size_h="$(human_size "$size_bytes")"
 			model_total_bytes=$((model_total_bytes + size_bytes))
-			label="$(artifact_label "$entry_name")"
+			label="$(artifact_label "$model_ref" "$entry_name")"
 			artifact_text="  - $label"
 			label_width="$(string_length "$artifact_text")"
 			if [ "$label_width" -gt "$max_width" ]; then
