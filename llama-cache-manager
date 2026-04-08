@@ -738,8 +738,8 @@ done
 
 [ -d "$CACHE_DIR" ] || die "cache directory not found: $CACHE_DIR"
 [ "$#" -gt 0 ] || {
-	usage
-	exit 1
+	list_models
+	exit 0
 }
 
 case "$1" in

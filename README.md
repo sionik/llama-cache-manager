@@ -24,6 +24,8 @@ Commands:
   rm, remove              Remove MODEL or MODEL:QUANT from the cache
 ```
 
+Running `llama-cache-manager` without a command is equivalent to `llama-cache-manager ls`.
+
 ### Shell Completions
 
 Print completion scripts to stdout:
