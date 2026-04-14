@@ -30,7 +30,7 @@ _llama_cache_manager() {
 	fi
 
 	if [ -z "$cmd" ]; then
-		suggestions=(-c --cache-dir -h --help help ls list rm remove)
+		suggestions=(-c --cache-dir -h --help -V --version help ls list rm remove)
 		COMPREPLY=($(compgen -W "${suggestions[*]}" -- "$cur"))
 		return 0
 	fi

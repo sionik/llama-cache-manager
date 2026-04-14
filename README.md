@@ -16,6 +16,7 @@ Usage:
 Options:
   -c DIR, --cache-dir DIR  Cache root. Default: LLAMA_CACHE or ~/.cache/llama.cpp
   -h, --help               Show this help
+  -V, --version            Show version
 
 Commands:
   completions             Print shell completion script to stdout
@@ -45,6 +46,7 @@ The repository also contains the raw completion files under
 
 ```text
 llama-cache-manager ls
+llama-cache-manager --version
 llama-cache-manager ls unsloth
 llama-cache-manager ls :UD-Q4_K_XL
 llama-cache-manager completions bash

@@ -22,6 +22,7 @@ end
 for cmd in llama-cache-manager
     complete -c $cmd -n '__lcm_no_command' -s c -l cache-dir -r -d 'Cache root'
     complete -c $cmd -n '__lcm_no_command' -s h -l help -d 'Show help'
+    complete -c $cmd -n '__lcm_no_command' -s V -l version -d 'Show version'
     complete -c $cmd -n '__lcm_no_command' -a 'help ls list rm remove'
 
     complete -c $cmd -n '__lcm_using_command help' -a 'help ls list rm remove'

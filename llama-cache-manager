@@ -3,6 +3,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
+VERSION="0.1.0"
 
 resolve_script_path() {
 	local source_path="${BASH_SOURCE[0]:-$0}"
@@ -78,6 +79,7 @@ Usage:
 Options:
   -c DIR, --cache-dir DIR  Cache root. Default: $DEFAULT_CACHE_HELP
   -h, --help               Show this help
+  -V, --version            Show version
 
 Commands:
   completions             Print shell completion script to stdout
@@ -85,6 +87,10 @@ Commands:
   ls, list                List cached models and artifacts
   rm, remove              Remove MODEL or MODEL:QUANT from the cache
 EOF
+}
+
+print_version() {
+	printf '%s v%s\n' "$SCRIPT_NAME" "$VERSION"
 }
 
 usage_list() {
@@ -727,6 +733,10 @@ while [ "$#" -gt 0 ]; do
 		;;
 	-h | --help)
 		usage
+		exit 0
+		;;
+	-V | --version)
+		print_version
 		exit 0
 		;;
 	*)

@@ -10,6 +10,8 @@ _llama_cache_manager() {
 		'--cache-dir[cache root]:directory:_files -/'
 		'-h[show help]'
 		'--help[show help]'
+		'-V[show version]'
+		'--version[show version]'
 	)
 
 	commands=(
