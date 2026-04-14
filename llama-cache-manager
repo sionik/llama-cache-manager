@@ -85,6 +85,7 @@ Commands:
   completions             Print shell completion script to stdout
   help                    Show global or command-specific help
   ls, list                List cached models and artifacts
+  prune                   Remove old snapshots
   rm, remove              Remove MODEL or MODEL:QUANT from the cache
 EOF
 }
@@ -110,6 +111,19 @@ Usage:
 Options:
   -n, --dry-run            Print actions without deleting
   -f, --force              Delete without confirmation
+EOF
+}
+
+usage_prune() {
+	cat <<EOF
+Usage:
+  $SCRIPT_NAME prune [-n|--dry-run] [-f|--force] [--until SPEC]
+
+Options:
+  -n, --dry-run            Print actions without deleting
+  -f, --force              Delete without confirmation
+      --until SPEC         Delete snapshots older than SPEC (for example: 7 days, 3days, 12h)
+                           Without --until, keep only the newest snapshot per model
 EOF
 }
 
@@ -172,6 +186,105 @@ format_local_timestamp() {
 
 current_time_epoch() {
 	date '+%s'
+}
+
+trim_whitespace() {
+	printf '%s' "$1" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/ /g'
+}
+
+parse_relative_until_epoch() {
+	local value="$1"
+	local unit="$2"
+	local gnu_unit bsd_unit
+
+	case "$unit" in
+	s | sec | secs | second | seconds)
+		gnu_unit="seconds"
+		bsd_unit="S"
+		;;
+	m | min | mins | minute | minutes)
+		gnu_unit="minutes"
+		bsd_unit="M"
+		;;
+	h | hr | hrs | hour | hours)
+		gnu_unit="hours"
+		bsd_unit="H"
+		;;
+	d | day | days)
+		gnu_unit="days"
+		bsd_unit="d"
+		;;
+	w | week | weeks)
+		gnu_unit="weeks"
+		bsd_unit="w"
+		;;
+	mon | month | months)
+		gnu_unit="months"
+		bsd_unit="m"
+		;;
+	y | yr | yrs | year | years)
+		gnu_unit="years"
+		bsd_unit="y"
+		;;
+	*)
+		return 1
+		;;
+	esac
+
+	if date -d "1 day ago" '+%s' >/dev/null 2>&1; then
+		date -d "$value $gnu_unit ago" '+%s'
+		return 0
+	fi
+
+	if date -v-"${value}${bsd_unit}" '+%s' >/dev/null 2>&1; then
+		date -v-"${value}${bsd_unit}" '+%s'
+		return 0
+	fi
+
+	return 1
+}
+
+parse_absolute_epoch() {
+	local spec="$1"
+	local format
+
+	if date -d "$spec" '+%s' >/dev/null 2>&1; then
+		date -d "$spec" '+%s'
+		return 0
+	fi
+
+	for format in \
+		'%Y-%m-%d' \
+		'%Y-%m-%d %H:%M' \
+		'%Y-%m-%d %H:%M:%S' \
+		'%Y-%m-%dT%H:%M' \
+		'%Y-%m-%dT%H:%M:%S' \
+		'%Y-%m-%dT%H:%M:%S%z'; do
+		if date -j -f "$format" "$spec" '+%s' >/dev/null 2>&1; then
+			date -j -f "$format" "$spec" '+%s'
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+parse_until_epoch() {
+	local spec="$1"
+	local normalized lower_spec value unit
+
+	normalized="$(trim_whitespace "$spec")"
+	[ -n "$normalized" ] || return 1
+	lower_spec="$(printf '%s' "$normalized" | tr '[:upper:]' '[:lower:]')"
+
+	if [[ "$lower_spec" =~ ^([0-9]+)[[:space:]]*([[:alpha:]]+)([[:space:]]+ago)?$ ]]; then
+		value="${BASH_REMATCH[1]}"
+		unit="${BASH_REMATCH[2]}"
+		parse_relative_until_epoch "$value" "$unit"
+		return $?
+	fi
+
+	parse_absolute_epoch "$normalized"
 }
 
 format_cached_age() {
@@ -429,7 +542,7 @@ matches_filters() {
 }
 
 complete_commands() {
-	printf '%s\n' help ls list rm remove
+	printf '%s\n' help ls list prune rm remove
 }
 
 complete_refs() {
@@ -487,7 +600,7 @@ run_complete() {
 	filters)
 		complete_refs filters | sort -u
 		;;
-	-h|--help|"")
+	-h | --help | "")
 		usage_complete
 		;;
 	*)
@@ -719,6 +832,18 @@ delete_blob_if_unreferenced() {
 	fi
 }
 
+delete_link_paths_for_model() {
+	local model="$1"
+	local link_path blob_path
+
+	while read -r link_path; do
+		[ -n "$link_path" ] || continue
+		blob_path="$(resolve_path "$link_path")"
+		delete_path "$link_path"
+		delete_blob_if_unreferenced "$model" "$blob_path" "$link_path"
+	done
+}
+
 prune_empty_dirs() {
 	local model="$1"
 	local model_path
@@ -738,12 +863,155 @@ prune_empty_dirs() {
 	fi
 }
 
+snapshot_cache_epoch() {
+	local revision_dir="$1"
+	local link_path blob_path cached_epoch latest_epoch=0
+	local found=0
+
+	while read -r link_path; do
+		[ -n "$link_path" ] || continue
+		blob_path="$(resolve_path "$link_path")"
+		cached_epoch="$(file_mtime_epoch "$blob_path")"
+		if [ "$found" -eq 0 ] || [ "$cached_epoch" -gt "$latest_epoch" ]; then
+			latest_epoch="$cached_epoch"
+			found=1
+		fi
+	done < <(find "$revision_dir" -mindepth 1 -maxdepth 1 -type l -name '*.gguf' | sort)
+
+	[ "$found" -eq 1 ] || return 1
+	printf '%s\n' "$latest_epoch"
+}
+
+collect_prune_candidates_until() {
+	local until_spec="$1"
+	local candidates_file="$2"
+	local until_epoch
+	local model_dir model snapshot_root revision_dir snapshot_epoch
+
+	until_epoch="$(parse_until_epoch "$until_spec")" || die "invalid --until value: $until_spec"
+
+	while read -r model_dir; do
+		snapshot_root="$model_dir/snapshots"
+		[ -d "$snapshot_root" ] || continue
+		model="$(basename "$model_dir")"
+
+		while read -r revision_dir; do
+			[ -n "$revision_dir" ] || continue
+			snapshot_epoch="$(snapshot_cache_epoch "$revision_dir" || true)"
+			[ -n "$snapshot_epoch" ] || continue
+
+			if [ "$snapshot_epoch" -le "$until_epoch" ]; then
+				printf '%s\t%s\t%s\n' "$model" "$revision_dir" "$snapshot_epoch" >>"$candidates_file"
+			fi
+		done < <(find "$snapshot_root" -mindepth 1 -maxdepth 1 -type d | sort)
+	done < <(find "$CACHE_DIR" -mindepth 1 -maxdepth 1 -type d -name 'models--*' | sort)
+
+	if [ ! -s "$candidates_file" ]; then
+		printf 'No snapshots older than %s (%s).\n' \
+			"$until_spec" \
+			"$(format_local_timestamp "$until_epoch")"
+	fi
+}
+
+collect_prune_candidates_keep_latest() {
+	local candidates_file="$1"
+	local model_dir model snapshot_root snapshot_file
+
+	while read -r model_dir; do
+		snapshot_root="$model_dir/snapshots"
+		[ -d "$snapshot_root" ] || continue
+		model="$(basename "$model_dir")"
+		snapshot_file="$(mktemp)"
+
+		while read -r revision_dir; do
+			local snapshot_epoch revision
+
+			[ -n "$revision_dir" ] || continue
+			snapshot_epoch="$(snapshot_cache_epoch "$revision_dir" || true)"
+			[ -n "$snapshot_epoch" ] || continue
+			revision="$(basename "$revision_dir")"
+			printf '%s\t%s\t%s\t%s\n' \
+				"$snapshot_epoch" \
+				"$revision" \
+				"$model" \
+				"$revision_dir" >>"$snapshot_file"
+		done < <(find "$snapshot_root" -mindepth 1 -maxdepth 1 -type d | sort)
+
+		if [ -s "$snapshot_file" ]; then
+			sort -t $'\t' -k1,1nr -k2,2r "$snapshot_file" | awk -F '\t' 'NR > 1 { print $3 "\t" $4 "\t" $1 }' >>"$candidates_file"
+		fi
+
+		rm -f "$snapshot_file"
+	done < <(find "$CACHE_DIR" -mindepth 1 -maxdepth 1 -type d -name 'models--*' | sort)
+
+	if [ ! -s "$candidates_file" ]; then
+		printf 'No old snapshots to prune.\n'
+	fi
+}
+
+execute_prune_candidates() {
+	local candidates_file="$1"
+	local confirm_prompt="$2"
+	local touched_models_file
+	local model revision_dir snapshot_epoch revision candidate_count
+
+	candidate_count="$(wc -l <"$candidates_file" | tr -d ' ')"
+	[ "$candidate_count" -gt 0 ] || return 0
+
+	touched_models_file="$(mktemp)"
+
+	if confirm "$confirm_prompt"; then
+		while IFS=$'\t' read -r model revision_dir snapshot_epoch; do
+			revision="$(basename "$revision_dir")"
+			printf 'pruning %s @ %s [latest blob %s]\n' \
+				"$(display_model_ref "$model")" \
+				"$(short_revision "$revision")" \
+				"$(format_local_timestamp "$snapshot_epoch")"
+			delete_link_paths_for_model "$model" < <(find "$revision_dir" -mindepth 1 -maxdepth 1 -type l -name '*.gguf' | sort)
+			printf '%s\n' "$model" >>"$touched_models_file"
+		done <"$candidates_file"
+
+		sort -u "$touched_models_file" | while read -r model; do
+			[ -n "$model" ] || continue
+			prune_empty_dirs "$model"
+		done
+	fi
+
+	rm -f "$touched_models_file"
+}
+
+prune_snapshots() {
+	local until_spec="${1:-}"
+	local candidates_file candidate_count until_epoch
+
+	candidates_file="$(mktemp)"
+
+	if [ -n "$until_spec" ]; then
+		collect_prune_candidates_until "$until_spec" "$candidates_file"
+		candidate_count="$(wc -l <"$candidates_file" | tr -d ' ')"
+		if [ "$candidate_count" -gt 0 ]; then
+			until_epoch="$(parse_until_epoch "$until_spec")" || die "invalid --until value: $until_spec"
+			execute_prune_candidates "$candidates_file" \
+				"Delete $candidate_count snapshot(s) older than $(format_local_timestamp "$until_epoch")?"
+		fi
+	else
+		collect_prune_candidates_keep_latest "$candidates_file"
+		candidate_count="$(wc -l <"$candidates_file" | tr -d ' ')"
+		if [ "$candidate_count" -gt 0 ]; then
+			execute_prune_candidates "$candidates_file" \
+				"Delete $candidate_count old snapshot(s), keeping the newest snapshot per model?"
+		fi
+	fi
+
+	rm -f "$candidates_file"
+}
+
 rm_quant_ref() {
 	local ref="$1"
 	local model="$1"
 	local quant=""
 	local matches=0
-	local link_path blob_path entry_name
+	local link_path entry_name
 	local model_quant_ref model_ref
 
 	model_quant_ref="$(split_model_quant_ref "$ref")"
@@ -769,11 +1037,7 @@ rm_quant_ref() {
 	}
 
 	if confirm "Delete $matches file(s) for quant $quant from $(display_model_ref "$model")?"; then
-		while read -r link_path; do
-			blob_path="$(resolve_path "$link_path")"
-			delete_path "$link_path"
-			delete_blob_if_unreferenced "$model" "$blob_path" "$link_path"
-		done </tmp/llama-cache-manager.matches.$$
+		delete_link_paths_for_model "$model" </tmp/llama-cache-manager.matches.$$
 		prune_empty_dirs "$model"
 	fi
 
@@ -859,6 +1123,9 @@ help)
 	ls | list)
 		usage_list
 		;;
+	prune)
+		usage_prune
+		;;
 	rm | remove)
 		usage_rm
 		;;
@@ -897,6 +1164,39 @@ ls | list)
 		list_models "$@"
 		;;
 	esac
+	;;
+prune)
+	shift
+	PRUNE_UNTIL=""
+
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+		-n | --dry-run)
+			DRY_RUN=1
+			;;
+		-f | --force)
+			FORCE=1
+			;;
+		--until)
+			shift
+			[ "$#" -gt 0 ] || die "--until requires a value"
+			PRUNE_UNTIL="$1"
+			;;
+		--until=*)
+			PRUNE_UNTIL="${1#--until=}"
+			;;
+		-h | --help)
+			usage_prune
+			exit 0
+			;;
+		*)
+			die "unknown prune argument: $1"
+			;;
+		esac
+		shift
+	done
+
+	prune_snapshots "$PRUNE_UNTIL"
 	;;
 rm | remove)
 	shift

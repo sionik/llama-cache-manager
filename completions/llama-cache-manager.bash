@@ -3,7 +3,7 @@ _llama_cache_manager() {
 	local -a suggestions
 
 	cur="${COMP_WORDS[COMP_CWORD]}"
-	prev="${COMP_WORDS[COMP_CWORD-1]}"
+	prev="${COMP_WORDS[COMP_CWORD - 1]}"
 	cmd=""
 	skip_next=0
 
@@ -14,10 +14,10 @@ _llama_cache_manager() {
 		fi
 
 		case "${COMP_WORDS[i]}" in
-		-c|--cache-dir)
+		-c | --cache-dir)
 			skip_next=1
 			;;
-		help|ls|list|rm|remove)
+		help | ls | list | prune | rm | remove)
 			cmd="${COMP_WORDS[i]}"
 			break
 			;;
@@ -30,23 +30,26 @@ _llama_cache_manager() {
 	fi
 
 	if [ -z "$cmd" ]; then
-		suggestions=(-c --cache-dir -h --help -V --version help ls list rm remove)
+		suggestions=(-c --cache-dir -h --help -V --version help ls list prune rm remove)
 		COMPREPLY=($(compgen -W "${suggestions[*]}" -- "$cur"))
 		return 0
 	fi
 
 	case "$cmd" in
 	help)
-		COMPREPLY=($(compgen -W "help ls list rm remove" -- "$cur"))
+		COMPREPLY=($(compgen -W "help ls list prune rm remove" -- "$cur"))
 		;;
-	ls|list)
+	ls | list)
 		if [[ "$cur" == -* ]]; then
 			COMPREPLY=($(compgen -W "-h --help" -- "$cur"))
 		else
 			COMPREPLY=($(compgen -W "$("${COMP_WORDS[0]}" __complete filters 2>/dev/null)" -- "$cur"))
 		fi
 		;;
-	rm|remove)
+	prune)
+		COMPREPLY=($(compgen -W "-n --dry-run -f --force --until -h --help" -- "$cur"))
+		;;
+	rm | remove)
 		if [[ "$cur" == -* ]]; then
 			COMPREPLY=($(compgen -W "-n --dry-run -f --force -h --help" -- "$cur"))
 		else

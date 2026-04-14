@@ -3,7 +3,7 @@
 _llama_cache_manager() {
 	local curcontext="$curcontext" state line cmd
 	local -i i skip_next
-	local -a global_opts commands rm_opts
+	local -a global_opts commands prune_opts rm_opts
 
 	global_opts=(
 		'-c[cache root]:directory:_files -/'
@@ -18,6 +18,7 @@ _llama_cache_manager() {
 		'help:show global or command-specific help'
 		'ls:list cached models and artifacts'
 		'list:list cached models and artifacts'
+		'prune:remove old snapshots'
 		'rm:remove MODEL or MODEL:QUANT from the cache'
 		'remove:remove MODEL or MODEL:QUANT from the cache'
 	)
@@ -27,6 +28,16 @@ _llama_cache_manager() {
 		'--dry-run[print actions without deleting]'
 		'-f[delete without confirmation]'
 		'--force[delete without confirmation]'
+		'-h[show help]'
+		'--help[show help]'
+	)
+
+	prune_opts=(
+		'-n[print actions without deleting]'
+		'--dry-run[print actions without deleting]'
+		'-f[delete without confirmation]'
+		'--force[delete without confirmation]'
+		'--until[delete snapshots older than cutoff; default keeps newest per model]:cutoff: '
 		'-h[show help]'
 		'--help[show help]'
 	)
@@ -43,7 +54,7 @@ _llama_cache_manager() {
 			-c|--cache-dir)
 				skip_next=1
 				;;
-			help|ls|list|rm|remove)
+			help|ls|list|prune|rm|remove)
 				cmd="${words[i]}"
 				break
 				;;
@@ -62,7 +73,7 @@ _llama_cache_manager() {
 
 	case "$cmd" in
 	help)
-		_arguments '2:command:(help ls list rm remove)'
+		_arguments '2:command:(help ls list prune rm remove)'
 		;;
 	ls|list)
 		if [[ ${words[CURRENT]} == -* ]]; then
@@ -70,6 +81,9 @@ _llama_cache_manager() {
 		else
 			compadd -- ${(f)"$(${words[1]} __complete filters 2>/dev/null)"}
 		fi
+		;;
+	prune)
+		_arguments -s $prune_opts
 		;;
 	rm|remove)
 		if [[ ${words[CURRENT]} == -* ]]; then

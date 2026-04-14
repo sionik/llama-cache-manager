@@ -22,6 +22,7 @@ Commands:
   completions             Print shell completion script to stdout
   help                    Show global or command-specific help
   ls, list                List cached models and artifacts
+  prune                   Remove old snapshots
   rm, remove              Remove MODEL or MODEL:QUANT from the cache
 ```
 
@@ -51,6 +52,9 @@ llama-cache-manager --version
 llama-cache-manager ls unsloth
 llama-cache-manager ls :UD-Q4_K_XL
 llama-cache-manager completions bash
+llama-cache-manager prune
+llama-cache-manager prune --until "7 days"
+llama-cache-manager prune --dry-run --until 3days
 llama-cache-manager rm -f unsloth/gpt-oss-20b-GGUF
 llama-cache-manager remove --dry-run unsloth/Qwen3.5-9B-GGUF:Q4_K_XL
 llama-cache-manager -c /srv/llama-models list
@@ -67,6 +71,22 @@ Supported remove targets:
 
 - `rm MODEL`: Removes the whole model with all quants
 - `rm MODEL:QUANT`: Removes a single quant
+
+### Prune Semantics
+
+`prune` without `--until` keeps only the newest snapshot revision per model and
+removes older revisions.
+
+`prune --until SPEC` removes snapshot revisions whose newest referenced blob is
+older than the cutoff.
+
+Accepted cutoff formats include relative ages such as:
+
+- `7 days`
+- `3days`
+- `12h`
+
+Absolute timestamps such as `2026-04-01` or `2026-04-01 12:30` are also accepted.
 
 ### List Filters
 
