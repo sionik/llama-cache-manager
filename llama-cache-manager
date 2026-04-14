@@ -323,6 +323,87 @@ human_size() {
 	printf '%s.%s%s' "$whole" "$frac" "${units[$unit]}"
 }
 
+pluralize() {
+	local count="$1"
+	local singular="$2"
+	local plural="$3"
+
+	if [ "$count" -eq 1 ]; then
+		printf '1 %s' "$singular"
+	else
+		printf '%s %s' "$count" "$plural"
+	fi
+}
+
+count_lines() {
+	wc -l <"$1" | tr -d ' '
+}
+
+reset_delete_summary() {
+	SUMMARY_LINK_COUNT=0
+	SUMMARY_BLOB_COUNT=0
+	SUMMARY_SNAPSHOT_DIR_COUNT=0
+	SUMMARY_MODEL_DIR_COUNT=0
+	SUMMARY_RECLAIMED_BYTES=0
+}
+
+print_delete_summary() {
+	local verb="Removed"
+	local reclaimed_text=""
+	local summary_line
+	local -a parts
+
+	if [ "$DRY_RUN" -eq 1 ]; then
+		verb="Would remove"
+	fi
+
+	parts+=("$(pluralize "$SUMMARY_LINK_COUNT" "artifact" "artifacts")")
+	parts+=("$(pluralize "$SUMMARY_BLOB_COUNT" "blob" "blobs")")
+	if [ "$SUMMARY_SNAPSHOT_DIR_COUNT" -gt 0 ]; then
+		parts+=("$(pluralize "$SUMMARY_SNAPSHOT_DIR_COUNT" "snapshot directory" "snapshot directories")")
+	fi
+	if [ "$SUMMARY_MODEL_DIR_COUNT" -gt 0 ]; then
+		parts+=("$(pluralize "$SUMMARY_MODEL_DIR_COUNT" "model directory" "model directories")")
+	fi
+	if [ "$SUMMARY_RECLAIMED_BYTES" -gt 0 ]; then
+		reclaimed_text=", reclaimed $(human_size "$SUMMARY_RECLAIMED_BYTES")"
+	fi
+
+	summary_line="$verb ${parts[0]}"
+	if [ "${#parts[@]}" -gt 1 ]; then
+		local i
+		for (( i = 1; i < ${#parts[@]}; i++ )); do
+			summary_line="$summary_line, ${parts[i]}"
+		done
+	fi
+
+	safe_printf "%s%s.\n" "$summary_line" "$reclaimed_text"
+}
+
+print_model_delete_summary() {
+	local model="$1"
+	local entries_file="$2"
+	local verb="Removed"
+	local artifact_count blob_count snapshot_count total_bytes
+
+	if [ "$DRY_RUN" -eq 1 ]; then
+		verb="Would remove"
+	fi
+
+	artifact_count="$(count_lines "$entries_file")"
+	blob_count="$(count_unique_field "$entries_file" 3)"
+	snapshot_count="$(count_unique_field "$entries_file" 4)"
+	total_bytes="$(sum_unique_blob_bytes "$entries_file")"
+
+	safe_printf "%s %s [%s] [%s] [%s] [%s].\n" \
+		"$verb" \
+		"$(paint "$COLOR_MODEL" "$(display_model_ref "$model")")" \
+		"$(pluralize "$snapshot_count" "snapshot" "snapshots")" \
+		"$(pluralize "$artifact_count" "artifact" "artifacts")" \
+		"$(pluralize "$blob_count" "blob" "blobs")" \
+		"$(human_size "$total_bytes")"
+}
+
 confirm() {
 	local prompt="$1"
 
@@ -346,10 +427,9 @@ delete_path() {
 	local path="$1"
 
 	if [ "$DRY_RUN" -eq 1 ]; then
-		printf 'DRY-RUN rm %s\n' "$path"
+		:
 	else
 		rm -rf -- "$path"
-		printf 'deleted %s\n' "$path"
 	fi
 }
 
@@ -357,10 +437,9 @@ delete_empty_dir() {
 	local path="$1"
 
 	if [ "$DRY_RUN" -eq 1 ]; then
-		printf 'DRY-RUN rmdir %s\n' "$path"
+		:
 	else
 		rmdir -- "$path"
-		printf 'deleted %s\n' "$path"
 	fi
 }
 
@@ -673,6 +752,131 @@ sum_unique_blob_bytes() {
 	awk -F '\t' '!seen[$3]++ { sum += $5 } END { print sum + 0 }' "$entries_file"
 }
 
+append_entry_for_link() {
+	local model="$1"
+	local link_path="$2"
+	local entries_file="$3"
+	local entry_name blob_path blob_id revision label size_bytes cached_epoch
+
+	entry_name="$(basename "$link_path")"
+	revision="$(basename "$(dirname "$link_path")")"
+	blob_path="$(resolve_path "$link_path")"
+	blob_id="$(basename "$blob_path")"
+	size_bytes="$(file_size_bytes "$blob_path")"
+	cached_epoch="$(file_mtime_epoch "$blob_path")"
+	label="$(artifact_label "$model" "$entry_name")"
+
+	printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+		"$(artifact_sort_key "$label")" \
+		"$label" \
+		"$blob_id" \
+		"$revision" \
+		"$size_bytes" \
+		"$cached_epoch" >>"$entries_file"
+}
+
+collect_entries_for_link_stream() {
+	local model="$1"
+	local entries_file="$2"
+	local link_path
+
+	while read -r link_path; do
+		[ -n "$link_path" ] || continue
+		append_entry_for_link "$model" "$link_path" "$entries_file"
+	done
+}
+
+collect_entries_for_revision_dir() {
+	local model="$1"
+	local revision_dir="$2"
+	local entries_file="$3"
+
+	collect_entries_for_link_stream "$model" "$entries_file" < <(
+		find "$revision_dir" -mindepth 1 -maxdepth 1 -type l -name '*.gguf' | sort
+	)
+}
+
+collect_entries_for_model() {
+	local model="$1"
+	local entries_file="$2"
+
+	collect_entries_for_link_stream "$model" "$entries_file" < <(
+		find "$(model_dir_path "$model")/snapshots" -type l -name '*.gguf' | sort
+	)
+}
+
+print_model_entries_preview() {
+	local model="$1"
+	local entries_file="$2"
+	local now_epoch model_total_bytes model_total_h snapshot_count
+
+	[ -s "$entries_file" ] || return 0
+
+	now_epoch="$(current_time_epoch)"
+	model_total_bytes="$(sum_unique_blob_bytes "$entries_file")"
+	model_total_h="$(human_size "$model_total_bytes")"
+	snapshot_count="$(count_unique_field "$entries_file" 4)"
+
+	safe_printf "%s %s %s\n" \
+		"$(paint "$COLOR_MODEL" "$(display_model_ref "$model")")" \
+		"$(paint "$COLOR_TOTAL_SIZE" "[$(printf '%8s' "$model_total_h")]")" \
+		"$(paint "$COLOR_SIZE" "[$(describe_snapshot_count "$snapshot_count")]")"
+
+	print_revisions_view "$entries_file" "$now_epoch"
+}
+
+print_delete_candidates_heading() {
+	local title="$1"
+	local details="${2:-}"
+	local suffix=""
+
+	if [ "$DRY_RUN" -eq 1 ]; then
+		suffix=" (dry-run)"
+	fi
+
+	safe_printf "%s\n" "$(paint "$COLOR_MODEL" "${title}${suffix}")"
+	if [ -n "$details" ]; then
+		safe_printf "%s\n" "$(paint "$COLOR_SIZE" "$details")"
+	fi
+	safe_printf '\n'
+}
+
+print_prune_candidates_preview() {
+	local candidates_file="$1"
+	local model entries_file first_model=1
+
+	while read -r model; do
+		[ -n "$model" ] || continue
+		entries_file="$(mktemp)"
+
+		while IFS=$'\t' read -r candidate_model revision_dir _snapshot_epoch; do
+			[ "$candidate_model" = "$model" ] || continue
+			collect_entries_for_revision_dir "$model" "$revision_dir" "$entries_file"
+		done <"$candidates_file"
+
+		if [ -s "$entries_file" ]; then
+			if [ "$first_model" -eq 0 ]; then
+				safe_printf '\n'
+			fi
+			first_model=0
+			print_model_entries_preview "$model" "$entries_file"
+		fi
+
+		rm -f "$entries_file"
+	done < <(awk -F '\t' '{ print $1 }' "$candidates_file" | sort -u)
+}
+
+print_single_model_delete_preview() {
+	local title="$1"
+	local details="$2"
+	local model="$3"
+	local entries_file="$4"
+
+	print_delete_candidates_heading "$title" "$details"
+	print_model_entries_preview "$model" "$entries_file"
+	safe_printf '\n'
+}
+
 print_revisions_view() {
 	local entries_file="$1"
 	local now_epoch="$2"
@@ -823,12 +1027,15 @@ delete_blob_if_unreferenced() {
 	local model="$1"
 	local blob_path="$2"
 	local skip_path="${3:-}"
-	local refs
+	local refs size_bytes
 
 	refs="$(count_blob_refs "$model" "$blob_path" "$skip_path")"
 
 	if [ "$refs" -eq 0 ] && [ -e "$blob_path" ]; then
+		size_bytes="$(file_size_bytes "$blob_path")"
 		delete_path "$blob_path"
+		SUMMARY_BLOB_COUNT=$((SUMMARY_BLOB_COUNT + 1))
+		SUMMARY_RECLAIMED_BYTES=$((SUMMARY_RECLAIMED_BYTES + size_bytes))
 	fi
 }
 
@@ -840,12 +1047,14 @@ delete_link_paths_for_model() {
 		[ -n "$link_path" ] || continue
 		blob_path="$(resolve_path "$link_path")"
 		delete_path "$link_path"
+		SUMMARY_LINK_COUNT=$((SUMMARY_LINK_COUNT + 1))
 		delete_blob_if_unreferenced "$model" "$blob_path" "$link_path"
 	done
 }
 
 prune_empty_dirs() {
 	local model="$1"
+	local auto_confirm_empty_model="${2:-0}"
 	local model_path
 	local snapshot_dir
 
@@ -854,11 +1063,13 @@ prune_empty_dirs() {
 	while read -r snapshot_dir; do
 		[ -n "$snapshot_dir" ] || continue
 		delete_empty_dir "$snapshot_dir"
+		SUMMARY_SNAPSHOT_DIR_COUNT=$((SUMMARY_SNAPSHOT_DIR_COUNT + 1))
 	done < <(find "$model_path/snapshots" -mindepth 1 -type d -empty 2>/dev/null | sort -r)
 
 	if ! find "$model_path/snapshots" -type l | grep -q .; then
-		if confirm "Delete empty model directory $model_path?"; then
+		if [ "$auto_confirm_empty_model" -eq 1 ] || confirm "Delete empty model directory $model_path?"; then
 			delete_path "$model_path"
+			SUMMARY_MODEL_DIR_COUNT=$((SUMMARY_MODEL_DIR_COUNT + 1))
 		fi
 	fi
 }
@@ -951,30 +1162,35 @@ collect_prune_candidates_keep_latest() {
 
 execute_prune_candidates() {
 	local candidates_file="$1"
-	local confirm_prompt="$2"
+	local preview_title="$2"
+	local preview_details="$3"
+	local confirm_prompt="$4"
+	local candidate_count
 	local touched_models_file
-	local model revision_dir snapshot_epoch revision candidate_count
+	local model revision_dir
 
-	candidate_count="$(wc -l <"$candidates_file" | tr -d ' ')"
+	candidate_count="$(count_lines "$candidates_file")"
 	[ "$candidate_count" -gt 0 ] || return 0
 
+	print_delete_candidates_heading "$preview_title" "$preview_details"
+	print_prune_candidates_preview "$candidates_file"
+	safe_printf '\n'
+
+	reset_delete_summary
 	touched_models_file="$(mktemp)"
 
 	if confirm "$confirm_prompt"; then
-		while IFS=$'\t' read -r model revision_dir snapshot_epoch; do
-			revision="$(basename "$revision_dir")"
-			printf 'pruning %s @ %s [latest blob %s]\n' \
-				"$(display_model_ref "$model")" \
-				"$(short_revision "$revision")" \
-				"$(format_local_timestamp "$snapshot_epoch")"
+		while IFS=$'\t' read -r model revision_dir _snapshot_epoch; do
 			delete_link_paths_for_model "$model" < <(find "$revision_dir" -mindepth 1 -maxdepth 1 -type l -name '*.gguf' | sort)
 			printf '%s\n' "$model" >>"$touched_models_file"
 		done <"$candidates_file"
 
-		sort -u "$touched_models_file" | while read -r model; do
+		while read -r model; do
 			[ -n "$model" ] || continue
-			prune_empty_dirs "$model"
-		done
+			prune_empty_dirs "$model" 1
+		done < <(sort -u "$touched_models_file")
+
+		print_delete_summary
 	fi
 
 	rm -f "$touched_models_file"
@@ -988,17 +1204,21 @@ prune_snapshots() {
 
 	if [ -n "$until_spec" ]; then
 		collect_prune_candidates_until "$until_spec" "$candidates_file"
-		candidate_count="$(wc -l <"$candidates_file" | tr -d ' ')"
+		candidate_count="$(count_lines "$candidates_file")"
 		if [ "$candidate_count" -gt 0 ]; then
 			until_epoch="$(parse_until_epoch "$until_spec")" || die "invalid --until value: $until_spec"
 			execute_prune_candidates "$candidates_file" \
+				"Delete candidates" \
+				"Snapshots older than $(format_local_timestamp "$until_epoch")" \
 				"Delete $candidate_count snapshot(s) older than $(format_local_timestamp "$until_epoch")?"
 		fi
 	else
 		collect_prune_candidates_keep_latest "$candidates_file"
-		candidate_count="$(wc -l <"$candidates_file" | tr -d ' ')"
+		candidate_count="$(count_lines "$candidates_file")"
 		if [ "$candidate_count" -gt 0 ]; then
 			execute_prune_candidates "$candidates_file" \
+				"Delete candidates" \
+				"Keeping the newest snapshot per model" \
 				"Delete $candidate_count old snapshot(s), keeping the newest snapshot per model?"
 		fi
 	fi
@@ -1013,6 +1233,7 @@ rm_quant_ref() {
 	local matches=0
 	local link_path entry_name
 	local model_quant_ref model_ref
+	local matches_file entries_file
 
 	model_quant_ref="$(split_model_quant_ref "$ref")"
 	model_ref="$(printf '%s\n' "$model_quant_ref" | sed -n '1p')"
@@ -1022,40 +1243,63 @@ rm_quant_ref() {
 
 	model="$(normalize_model_ref "$model")"
 	ensure_model_exists "$model"
+	matches_file="$(mktemp)"
+	entries_file="$(mktemp)"
 
 	find "$(model_dir_path "$model")/snapshots" -type l -name '*.gguf' | sort | while read -r link_path; do
 		entry_name="$(basename "$link_path")"
 		if printf '%s\n' "$entry_name" | grep -Eq -- "-${quant}\.gguf$"; then
 			printf '%s\n' "$link_path"
 		fi
-	done >/tmp/llama-cache-manager.matches.$$
+	done >"$matches_file"
 
-	matches="$(wc -l </tmp/llama-cache-manager.matches.$$ | tr -d ' ')"
+	matches="$(count_lines "$matches_file")"
 	[ "$matches" -gt 0 ] || {
-		rm -f /tmp/llama-cache-manager.matches.$$
+		rm -f "$matches_file" "$entries_file"
 		die "quant not found in model: $quant"
 	}
 
-	if confirm "Delete $matches file(s) for quant $quant from $(display_model_ref "$model")?"; then
-		delete_link_paths_for_model "$model" </tmp/llama-cache-manager.matches.$$
-		prune_empty_dirs "$model"
+	collect_entries_for_link_stream "$model" "$entries_file" <"$matches_file"
+	print_single_model_delete_preview \
+		"Delete candidates" \
+		"Quant $quant in $(display_model_ref "$model")" \
+		"$model" \
+		"$entries_file"
+
+	reset_delete_summary
+	if confirm "Delete $matches artifact(s) for quant $quant from $(display_model_ref "$model")?"; then
+		delete_link_paths_for_model "$model" <"$matches_file"
+		prune_empty_dirs "$model" 1
+		print_delete_summary
 	fi
 
-	rm -f /tmp/llama-cache-manager.matches.$$
+	rm -f "$matches_file" "$entries_file"
 }
 
 rm_model_ref() {
 	local ref="$1"
 	local model
 	local model_path
+	local entries_file
 
 	model="$(normalize_model_ref "$ref")"
 	ensure_model_exists "$model"
 	model_path="$(model_dir_path "$model")"
+	entries_file="$(mktemp)"
+
+	collect_entries_for_model "$model" "$entries_file"
+	print_single_model_delete_preview \
+		"Delete candidates" \
+		"Full model removal" \
+		"$model" \
+		"$entries_file"
 
 	if confirm "Delete full model cache $(display_model_ref "$model")?"; then
 		delete_path "$model_path"
+		print_model_delete_summary "$model" "$entries_file"
 	fi
+
+	rm -f "$entries_file"
 }
 
 rm_ref() {
@@ -1077,6 +1321,7 @@ CACHE_DIR="$DEFAULT_CACHE_DIR"
 FORCE=0
 DRY_RUN=0
 init_colors
+reset_delete_summary
 
 while [ "$#" -gt 0 ]; do
 	case "$1" in
