@@ -26,6 +26,7 @@ Commands:
 ```
 
 Running `llama-cache-manager` without a command is equivalent to `llama-cache-manager ls`.
+Artifact rows include the local cache age derived from the blob mtime, for example `cached 7 days ago (on 2026-04-07 15:23)`.
 
 ### Shell Completions
 

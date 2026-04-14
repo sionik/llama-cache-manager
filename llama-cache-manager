@@ -98,7 +98,7 @@ usage_list() {
 Usage:
   $SCRIPT_NAME {ls|list} [FILTER...]
 
-List cached models grouped by model, with artifact sizes and total size.
+List cached models grouped by snapshot, with deduplicated model totals.
 EOF
 }
 
@@ -150,6 +150,48 @@ file_size_bytes() {
 	else
 		stat -f '%z' "$1"
 	fi
+}
+
+file_mtime_epoch() {
+	if stat -c '%Y' "$1" >/dev/null 2>&1; then
+		stat -c '%Y' "$1"
+	else
+		stat -f '%m' "$1"
+	fi
+}
+
+format_local_timestamp() {
+	local epoch="$1"
+
+	if date -d "@$epoch" '+%Y-%m-%d %H:%M' >/dev/null 2>&1; then
+		date -d "@$epoch" '+%Y-%m-%d %H:%M'
+	else
+		date -r "$epoch" '+%Y-%m-%d %H:%M'
+	fi
+}
+
+current_time_epoch() {
+	date '+%s'
+}
+
+format_cached_age() {
+	local now_epoch="$1"
+	local cached_epoch="$2"
+	local cached_at age_days day_label
+
+	if [ "$cached_epoch" -gt "$now_epoch" ]; then
+		age_days=0
+	else
+		age_days=$(((now_epoch - cached_epoch) / 86400))
+	fi
+
+	cached_at="$(format_local_timestamp "$cached_epoch")"
+	day_label="days"
+	if [ "$age_days" -eq 1 ]; then
+		day_label="day"
+	fi
+
+	printf 'cached %s %s ago (on %s)' "$age_days" "$day_label" "$cached_at"
 }
 
 human_size() {
@@ -477,120 +519,168 @@ print_completion_script() {
 	cat -- "$path"
 }
 
+short_id() {
+	printf '%s\n' "${1:0:8}"
+}
+
+short_revision() {
+	printf '%s\n' "${1:0:7}"
+}
+
+describe_snapshot_count() {
+	local count="$1"
+
+	if [ "$count" -eq 1 ]; then
+		printf '1 snapshot'
+	else
+		printf '%s snapshots' "$count"
+	fi
+}
+
+count_unique_field() {
+	local entries_file="$1"
+	local field="$2"
+	local label="${3:-}"
+	local blob_id="${4:-}"
+
+	awk -F '\t' -v field="$field" -v label="$label" -v blob_id="$blob_id" '
+		(label == "" || $2 == label) && (blob_id == "" || $3 == blob_id) { seen[$field] = 1 }
+		END {
+			for (key in seen) {
+				count++
+			}
+			print count + 0
+		}
+	' "$entries_file"
+}
+
+sum_unique_blob_bytes() {
+	local entries_file="$1"
+
+	awk -F '\t' '!seen[$3]++ { sum += $5 } END { print sum + 0 }' "$entries_file"
+}
+
+print_revisions_view() {
+	local entries_file="$1"
+	local now_epoch="$2"
+	local tab=$'\t'
+	local revision revision_epoch
+	local label blob_id size_bytes cached_epoch size_h cached_text
+	local max_label_width=0
+	local prefix_text padded_prefix_text
+
+	while IFS=$'\t' read -r _sort_key label; do
+		[ -n "$label" ] || continue
+		prefix_text="    - $label"
+		if [ "$(string_length "$prefix_text")" -gt "$max_label_width" ]; then
+			max_label_width="$(string_length "$prefix_text")"
+		fi
+	done < <(
+		awk -F '\t' '!seen[$1 FS $2]++ { print $1 "\t" $2 }' "$entries_file" |
+			sort -t "$tab" -k1,1 -k2,2
+	)
+
+	while IFS=$'\t' read -r revision revision_epoch; do
+		[ -n "$revision" ] || continue
+		safe_printf "%s\n" \
+			"$(paint "$COLOR_MODEL" "  - $(short_revision "$revision")")"
+
+		while IFS=$'\t' read -r _sort_key label blob_id _revision size_bytes cached_epoch; do
+			[ -n "$label" ] || continue
+			size_h="$(human_size "$size_bytes")"
+			cached_text="$(format_cached_age "$now_epoch" "$cached_epoch")"
+			padded_prefix_text="$(printf "%-*s" "$max_label_width" "    - $label")"
+
+			safe_printf "    %s %s %s %s\n" \
+				"$(paint "$(artifact_color "$label")" "${padded_prefix_text#    }")" \
+				"$(paint "$COLOR_SIZE" "[$(printf '%8s' "$size_h")]")" \
+				"$(paint "$COLOR_SIZE" "[$cached_text]")" \
+				"$(paint "$COLOR_SIZE" "[$(short_id "$blob_id")]")"
+		done < <(
+			awk -F '\t' -v revision="$revision" '$4 == revision { print }' "$entries_file" |
+				sort -t "$tab" -k1,1 -k2,2
+		)
+	done < <(
+		awk -F '\t' '
+			{
+				if (!seen[$4] || $6 > latest[$4]) {
+					latest[$4] = $6
+				}
+				seen[$4] = 1
+			}
+			END {
+				for (revision in seen) {
+					print revision "\t" latest[revision]
+				}
+			}
+		' "$entries_file" |
+			sort -t "$tab" -k2,2nr -k1,1
+	)
+}
+
 list_models() {
 	local -a filters
-	local model_dir snapshot_dir model_ref
-	local entry_name entry_path blob_path size_bytes size_h label
-	local model_total_bytes total_h
+	local model_dir snapshot_dir model_ref entries_file
+	local entry_name entry_path blob_path blob_id revision label
+	local size_bytes cached_epoch
+	local model_total_bytes model_total_h snapshot_count
+	local now_epoch
 	local first_model=1
-	local max_width label_width
-	local artifact_prefix artifact_text padded_text
-	local total_size_text line_size_text
-	local -a row_kind row_label row_size
-	local -a model_artifact_label model_artifact_size model_artifact_sort
-	local row_count=0
-	local model_artifact_count
-	local matched_count
 
 	filters=("$@")
-	max_width=0
+	now_epoch="$(current_time_epoch)"
 
 	while read -r model_dir; do
 		snapshot_dir="$model_dir/snapshots"
 		[ -d "$snapshot_dir" ] || continue
 		model_ref="$(display_model_ref "$(basename "$model_dir")")"
-		model_total_bytes=0
-		model_artifact_count=0
-		matched_count=0
-
-		label_width="$(string_length "$model_ref")"
-		if [ "$label_width" -gt "$max_width" ]; then
-			max_width="$label_width"
-		fi
+		entries_file="$(mktemp)"
 
 		while read -r entry_path; do
 			entry_name="$(basename "$entry_path")"
+			revision="$(basename "$(dirname "$entry_path")")"
 			blob_path="$(resolve_path "$entry_path")"
+			blob_id="$(basename "$blob_path")"
 			size_bytes="$(file_size_bytes "$blob_path")"
-			size_h="$(human_size "$size_bytes")"
+			cached_epoch="$(file_mtime_epoch "$blob_path")"
 			label="$(artifact_label "$model_ref" "$entry_name")"
+
 			if ! matches_filters "$model_ref" "$label" "${filters[@]}"; then
 				continue
 			fi
 
-			model_total_bytes=$((model_total_bytes + size_bytes))
-			matched_count=$((matched_count + 1))
-			artifact_text="  - $label"
-			label_width="$(string_length "$artifact_text")"
-			if [ "$label_width" -gt "$max_width" ]; then
-				max_width="$label_width"
-			fi
-			model_artifact_label[$model_artifact_count]="$label"
-			model_artifact_size[$model_artifact_count]="$size_h"
-			model_artifact_sort[$model_artifact_count]="$(artifact_sort_key "$label")"
-			model_artifact_count=$((model_artifact_count + 1))
+			printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+				"$(artifact_sort_key "$label")" \
+				"$label" \
+				"$blob_id" \
+				"$revision" \
+				"$size_bytes" \
+				"$cached_epoch" >>"$entries_file"
 		done < <(find "$snapshot_dir" -mindepth 2 -maxdepth 2 -type l -name '*.gguf' | sort)
 
-		[ "$matched_count" -gt 0 ] || continue
+		if [ ! -s "$entries_file" ]; then
+			rm -f "$entries_file"
+			continue
+		fi
 
-		total_h="$(human_size "$model_total_bytes")"
-		row_kind[$row_count]="M"
-		row_label[$row_count]="$model_ref"
-		row_size[$row_count]="$total_h"
-		row_count=$((row_count + 1))
+		model_total_bytes="$(sum_unique_blob_bytes "$entries_file")"
+		model_total_h="$(human_size "$model_total_bytes")"
+		snapshot_count="$(count_unique_field "$entries_file" 4)"
 
-		local j sorted_indexes
-		sorted_indexes="$(
-			for ((j = 0; j < model_artifact_count; j++)); do
-				printf '%s\t%s\n' "${model_artifact_sort[$j]}" "$j"
-			done | sort | cut -f2
-		)"
+		if [ "$first_model" -eq 0 ]; then
+			safe_printf '\n'
+		fi
+		first_model=0
 
-		while read -r j; do
-			[ -n "$j" ] || continue
-			row_kind[$row_count]="A"
-			row_label[$row_count]="${model_artifact_label[$j]}"
-			row_size[$row_count]="${model_artifact_size[$j]}"
-			row_count=$((row_count + 1))
-		done <<<"$sorted_indexes"
+		safe_printf "%s %s %s\n" \
+			"$(paint "$COLOR_MODEL" "$model_ref")" \
+			"$(paint "$COLOR_TOTAL_SIZE" "[$(printf '%8s' "$model_total_h")]")" \
+			"$(paint "$COLOR_SIZE" "[$(describe_snapshot_count "$snapshot_count")]")"
 
-		row_kind[$row_count]="B"
-		row_label[$row_count]=""
-		row_size[$row_count]=""
-		row_count=$((row_count + 1))
+		print_revisions_view "$entries_file" "$now_epoch"
+
+		rm -f "$entries_file"
 	done < <(find "$CACHE_DIR" -mindepth 1 -maxdepth 1 -type d -name 'models--*' | sort)
-
-	[ "$row_count" -gt 0 ] || return 0
-
-	local i kind field1 field2
-	for ((i = 0; i < ${#row_kind[@]}; i++)); do
-		kind="${row_kind[$i]}"
-		field1="${row_label[$i]}"
-		field2="${row_size[$i]}"
-
-		case "$kind" in
-		A)
-			artifact_prefix="  - $field1"
-			line_size_text="[$(printf '%8s' "$field2")]"
-			padded_text="$(printf "%-*s" "$max_width" "$artifact_prefix")"
-			safe_printf "%s %s\n" \
-				"$(paint "$(artifact_color "$field1")" "$padded_text")" \
-				"$(paint "$COLOR_SIZE" "$line_size_text")"
-			;;
-		M)
-			if [ "$first_model" -eq 0 ]; then
-				safe_printf '\n'
-			fi
-			first_model=0
-			total_size_text="[$(printf '%8s' "$field2")]"
-			padded_text="$(printf "%-*s" "$max_width" "$field1")"
-			safe_printf "%s %s\n" \
-				"$(paint "$COLOR_MODEL" "$padded_text")" \
-				"$(paint "$COLOR_TOTAL_SIZE" "$total_size_text")"
-			;;
-		B) ;;
-		esac
-	done
 }
 
 ensure_model_exists() {
