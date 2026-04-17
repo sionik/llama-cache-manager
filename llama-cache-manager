@@ -21,6 +21,7 @@ DEFAULT_CACHE_DIR="${LLAMA_CACHE:-${HF_HOME:-$HOME/.cache}/llama.cpp}"
 DEFAULT_CACHE_FALLBACK="${HF_HOME:-$HOME/.cache}/llama.cpp"
 DEFAULT_CACHE_HELP_FALLBACK="${DEFAULT_CACHE_FALLBACK/#$HOME/\~}"
 DEFAULT_CACHE_HELP="LLAMA_CACHE or $DEFAULT_CACHE_HELP_FALLBACK"
+ORPHAN_REVISION="__unreferenced__"
 
 handle_sigpipe() {
 	exit 0
@@ -42,6 +43,7 @@ init_colors() {
 	COLOR_TOTAL_SIZE=""
 	COLOR_QUANT=""
 	COLOR_MMPROJ=""
+	COLOR_ORPHAN=""
 	COLOR_SIZE=""
 
 	if [ -n "${NO_COLOR:-}" ]; then
@@ -57,6 +59,7 @@ init_colors() {
 	COLOR_TOTAL_SIZE=$'\033[36m'
 	COLOR_QUANT=$'\033[34m'
 	COLOR_MMPROJ=$'\033[33m'
+	COLOR_ORPHAN=$'\033[31m'
 	COLOR_SIZE=$'\033[90m'
 }
 
@@ -99,7 +102,7 @@ usage_list() {
 Usage:
   $SCRIPT_NAME {ls|list} [FILTER...]
 
-List cached models grouped by snapshot, with deduplicated model totals.
+List cached models grouped by snapshot, including unreferenced blob files.
 EOF
 }
 
@@ -124,6 +127,7 @@ Options:
   -f, --force              Delete without confirmation
       --until SPEC         Delete snapshots older than SPEC (for example: 7 days, 3days, 12h)
                            Without --until, keep only the newest snapshot per model
+                           Unreferenced blob files are always included as prune candidates
 EOF
 }
 
@@ -155,6 +159,14 @@ resolve_path() {
 		realpath "$1"
 	else
 		readlink -f "$1"
+	fi
+}
+
+resolve_path_or_empty() {
+	if have_cmd realpath; then
+		realpath "$1" 2>/dev/null || true
+	else
+		readlink -f "$1" 2>/dev/null || true
 	fi
 }
 
@@ -384,22 +396,35 @@ print_model_delete_summary() {
 	local model="$1"
 	local entries_file="$2"
 	local verb="Removed"
-	local artifact_count blob_count snapshot_count total_bytes
+	local artifact_count blob_count snapshot_count orphan_count total_bytes
 
 	if [ "$DRY_RUN" -eq 1 ]; then
 		verb="Would remove"
 	fi
 
-	artifact_count="$(count_lines "$entries_file")"
+	artifact_count="$(awk -F '\t' -v orphan_revision="$ORPHAN_REVISION" '$4 != orphan_revision { count++ } END { print count + 0 }' "$entries_file")"
 	blob_count="$(count_unique_field "$entries_file" 3)"
-	snapshot_count="$(count_unique_field "$entries_file" 4)"
+	snapshot_count="$(awk -F '\t' -v orphan_revision="$ORPHAN_REVISION" '
+		$4 != "" && $4 != orphan_revision { seen[$4] = 1 }
+		END {
+			for (key in seen) {
+				count++
+			}
+			print count + 0
+		}
+	' "$entries_file")"
+	orphan_count="$(count_orphan_blob_entries "$entries_file")"
 	total_bytes="$(sum_unique_blob_bytes "$entries_file")"
 
-	safe_printf "%s %s [%s] [%s] [%s] [%s].\n" \
+	safe_printf "%s %s [%s] [%s]" \
 		"$verb" \
 		"$(paint "$COLOR_MODEL" "$(display_model_ref "$model")")" \
 		"$(pluralize "$snapshot_count" "snapshot" "snapshots")" \
-		"$(pluralize "$artifact_count" "artifact" "artifacts")" \
+		"$(pluralize "$artifact_count" "artifact" "artifacts")"
+	if [ "$orphan_count" -gt 0 ]; then
+		safe_printf " [%s]" "$(describe_orphan_blob_count "$orphan_count")"
+	fi
+	safe_printf " [%s] [%s].\n" \
 		"$(pluralize "$blob_count" "blob" "blobs")" \
 		"$(human_size "$total_bytes")"
 }
@@ -729,6 +754,16 @@ describe_snapshot_count() {
 	fi
 }
 
+describe_orphan_blob_count() {
+	local count="$1"
+
+	if [ "$count" -eq 1 ]; then
+		printf '1 unreferenced blob'
+	else
+		printf '%s unreferenced blobs' "$count"
+	fi
+}
+
 count_unique_field() {
 	local entries_file="$1"
 	local field="$2"
@@ -746,6 +781,17 @@ count_unique_field() {
 	' "$entries_file"
 }
 
+count_orphan_blob_entries() {
+	local entries_file="$1"
+
+	awk -F '\t' -v orphan_revision="$ORPHAN_REVISION" '$4 == orphan_revision { seen[$3] = 1 } END {
+		for (key in seen) {
+			count++
+		}
+		print count + 0
+	}' "$entries_file"
+}
+
 sum_unique_blob_bytes() {
 	local entries_file="$1"
 
@@ -760,7 +806,8 @@ append_entry_for_link() {
 
 	entry_name="$(basename "$link_path")"
 	revision="$(basename "$(dirname "$link_path")")"
-	blob_path="$(resolve_path "$link_path")"
+	blob_path="$(resolve_path_or_empty "$link_path")"
+	[ -n "$blob_path" ] || return 0
 	blob_id="$(basename "$blob_path")"
 	size_bytes="$(file_size_bytes "$blob_path")"
 	cached_epoch="$(file_mtime_epoch "$blob_path")"
@@ -771,6 +818,25 @@ append_entry_for_link() {
 		"$label" \
 		"$blob_id" \
 		"$revision" \
+		"$size_bytes" \
+		"$cached_epoch" >>"$entries_file"
+}
+
+append_orphan_entry_for_blob() {
+	local blob_path="$1"
+	local entries_file="$2"
+	local blob_id size_bytes cached_epoch
+
+	[ -e "$blob_path" ] || return 0
+	blob_id="$(basename "$blob_path")"
+	size_bytes="$(file_size_bytes "$blob_path")"
+	cached_epoch="$(file_mtime_epoch "$blob_path")"
+
+	printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+		"2|$blob_id" \
+		"unreferenced blob" \
+		"$blob_id" \
+		"$ORPHAN_REVISION" \
 		"$size_bytes" \
 		"$cached_epoch" >>"$entries_file"
 }
@@ -803,26 +869,115 @@ collect_entries_for_model() {
 	collect_entries_for_link_stream "$model" "$entries_file" < <(
 		find "$(model_dir_path "$model")/snapshots" -type l -name '*.gguf' | sort
 	)
+	collect_orphan_blob_entries_for_model "$model" "$entries_file"
+}
+
+collect_referenced_blob_paths() {
+	local model="$1"
+	local refs_file="$2"
+	local link_path blob_path
+
+	: >"$refs_file"
+
+	while read -r link_path; do
+		[ -n "$link_path" ] || continue
+		blob_path="$(resolve_path_or_empty "$link_path")"
+		[ -n "$blob_path" ] || continue
+		printf '%s\n' "$blob_path" >>"$refs_file"
+	done < <(find "$(model_dir_path "$model")/snapshots" -type l -name '*.gguf' | sort)
+
+	if [ -s "$refs_file" ]; then
+		sort -u -o "$refs_file" "$refs_file"
+	fi
+}
+
+blob_path_is_referenced() {
+	local refs_file="$1"
+	local blob_path="$2"
+
+	[ -s "$refs_file" ] || return 1
+	grep -Fqx -- "$blob_path" "$refs_file"
+}
+
+collect_orphan_blob_paths_for_model() {
+	local model="$1"
+	local paths_file="$2"
+	local blobs_dir refs_file blob_path
+
+	blobs_dir="$(model_dir_path "$model")/blobs"
+	[ -d "$blobs_dir" ] || {
+		: >"$paths_file"
+		return 0
+	}
+
+	refs_file="$(mktemp)"
+	collect_referenced_blob_paths "$model" "$refs_file"
+	: >"$paths_file"
+
+	while read -r blob_path; do
+		[ -n "$blob_path" ] || continue
+		if blob_path_is_referenced "$refs_file" "$blob_path"; then
+			continue
+		fi
+		printf '%s\n' "$blob_path" >>"$paths_file"
+	done < <(find "$blobs_dir" -mindepth 1 -maxdepth 1 -type f | sort)
+
+	rm -f "$refs_file"
+}
+
+collect_orphan_blob_entries_for_model() {
+	local model="$1"
+	local entries_file="$2"
+	local paths_file blob_path
+
+	paths_file="$(mktemp)"
+	collect_orphan_blob_paths_for_model "$model" "$paths_file"
+
+	while read -r blob_path; do
+		[ -n "$blob_path" ] || continue
+		append_orphan_entry_for_blob "$blob_path" "$entries_file"
+	done <"$paths_file"
+
+	rm -f "$paths_file"
 }
 
 print_model_entries_preview() {
 	local model="$1"
 	local entries_file="$2"
-	local now_epoch model_total_bytes model_total_h snapshot_count
+	local now_epoch model_total_bytes model_total_h snapshot_count orphan_count
 
 	[ -s "$entries_file" ] || return 0
 
 	now_epoch="$(current_time_epoch)"
 	model_total_bytes="$(sum_unique_blob_bytes "$entries_file")"
 	model_total_h="$(human_size "$model_total_bytes")"
-	snapshot_count="$(count_unique_field "$entries_file" 4)"
+	snapshot_count="$(awk -F '\t' -v orphan_revision="$ORPHAN_REVISION" '
+		$4 != "" && $4 != orphan_revision { seen[$4] = 1 }
+		END {
+			for (key in seen) {
+				count++
+			}
+			print count + 0
+		}
+	' "$entries_file")"
+	orphan_count="$(count_orphan_blob_entries "$entries_file")"
 
-	safe_printf "%s %s %s\n" \
+	safe_printf "%s %s" \
 		"$(paint "$COLOR_MODEL" "$(display_model_ref "$model")")" \
-		"$(paint "$COLOR_TOTAL_SIZE" "[$(printf '%8s' "$model_total_h")]")" \
-		"$(paint "$COLOR_SIZE" "[$(describe_snapshot_count "$snapshot_count")]")"
+		"$(paint "$COLOR_TOTAL_SIZE" "[$(printf '%8s' "$model_total_h")]")"
+	if [ "$snapshot_count" -gt 0 ]; then
+		safe_printf " %s" "$(paint "$COLOR_SIZE" "[$(describe_snapshot_count "$snapshot_count")]")"
+	fi
+	if [ "$orphan_count" -gt 0 ]; then
+		safe_printf " %s" "$(paint "$COLOR_SIZE" "[$(describe_orphan_blob_count "$orphan_count")]")"
+	fi
+	safe_printf '\n'
 
 	print_revisions_view "$entries_file" "$now_epoch"
+	if [ "$snapshot_count" -gt 0 ] && [ "$orphan_count" -gt 0 ]; then
+		safe_printf '\n'
+	fi
+	print_orphan_blobs_view "$entries_file" "$now_epoch"
 }
 
 print_delete_candidates_heading() {
@@ -842,7 +997,8 @@ print_delete_candidates_heading() {
 }
 
 print_prune_candidates_preview() {
-	local candidates_file="$1"
+	local snapshot_candidates_file="$1"
+	local orphan_candidates_file="$2"
 	local model entries_file first_model=1
 
 	while read -r model; do
@@ -852,7 +1008,12 @@ print_prune_candidates_preview() {
 		while IFS=$'\t' read -r candidate_model revision_dir _snapshot_epoch; do
 			[ "$candidate_model" = "$model" ] || continue
 			collect_entries_for_revision_dir "$model" "$revision_dir" "$entries_file"
-		done <"$candidates_file"
+		done <"$snapshot_candidates_file"
+
+		while IFS=$'\t' read -r candidate_model blob_path; do
+			[ "$candidate_model" = "$model" ] || continue
+			append_orphan_entry_for_blob "$blob_path" "$entries_file"
+		done <"$orphan_candidates_file"
 
 		if [ -s "$entries_file" ]; then
 			if [ "$first_model" -eq 0 ]; then
@@ -863,7 +1024,12 @@ print_prune_candidates_preview() {
 		fi
 
 		rm -f "$entries_file"
-	done < <(awk -F '\t' '{ print $1 }' "$candidates_file" | sort -u)
+	done < <(
+		{
+			awk -F '\t' '{ print $1 }' "$snapshot_candidates_file"
+			awk -F '\t' '{ print $1 }' "$orphan_candidates_file"
+		} | awk 'NF > 0' | sort -u
+	)
 }
 
 print_single_model_delete_preview() {
@@ -893,7 +1059,7 @@ print_revisions_view() {
 			max_label_width="$(string_length "$prefix_text")"
 		fi
 	done < <(
-		awk -F '\t' '!seen[$1 FS $2]++ { print $1 "\t" $2 }' "$entries_file" |
+		awk -F '\t' -v orphan_revision="$ORPHAN_REVISION" '$4 != orphan_revision && !seen[$1 FS $2]++ { print $1 "\t" $2 }' "$entries_file" |
 			sort -t "$tab" -k1,1 -k2,2
 	)
 
@@ -918,8 +1084,11 @@ print_revisions_view() {
 				sort -t "$tab" -k1,1 -k2,2
 		)
 	done < <(
-		awk -F '\t' '
+		awk -F '\t' -v orphan_revision="$ORPHAN_REVISION" '
 			{
+				if ($4 == orphan_revision) {
+					next
+				}
 				if (!seen[$4] || $6 > latest[$4]) {
 					latest[$4] = $6
 				}
@@ -935,67 +1104,87 @@ print_revisions_view() {
 	)
 }
 
+print_orphan_blobs_view() {
+	local entries_file="$1"
+	local now_epoch="$2"
+	local label blob_id size_bytes cached_epoch size_h cached_text
+	local max_label_width=0
+	local prefix_text padded_prefix_text
+
+	awk -F '\t' -v orphan_revision="$ORPHAN_REVISION" '$4 == orphan_revision { found = 1 } END { exit(found ? 0 : 1) }' "$entries_file" || return 0
+
+	while IFS=$'\t' read -r _sort_key label; do
+		[ -n "$label" ] || continue
+		prefix_text="    - $label"
+		if [ "$(string_length "$prefix_text")" -gt "$max_label_width" ]; then
+			max_label_width="$(string_length "$prefix_text")"
+		fi
+	done < <(
+		awk -F '\t' -v orphan_revision="$ORPHAN_REVISION" '$4 == orphan_revision && !seen[$2]++ { print $1 "\t" $2 }' "$entries_file" |
+			sort -t $'\t' -k1,1 -k2,2
+	)
+
+	safe_printf "%s\n" "$(paint "$COLOR_MODEL" "  - unreferenced")"
+
+	while IFS=$'\t' read -r _sort_key label blob_id _revision size_bytes cached_epoch; do
+		[ -n "$blob_id" ] || continue
+		size_h="$(human_size "$size_bytes")"
+		cached_text="$(format_cached_age "$now_epoch" "$cached_epoch")"
+		padded_prefix_text="$(printf "%-*s" "$max_label_width" "    - $label")"
+
+		safe_printf "    %s %s %s %s\n" \
+			"$(paint "$COLOR_ORPHAN" "${padded_prefix_text#    }")" \
+			"$(paint "$COLOR_SIZE" "[$(printf '%8s' "$size_h")]")" \
+			"$(paint "$COLOR_SIZE" "[$cached_text]")" \
+			"$(paint "$COLOR_SIZE" "[$(short_id "$blob_id")]")"
+	done < <(
+		awk -F '\t' -v orphan_revision="$ORPHAN_REVISION" '$4 == orphan_revision { print }' "$entries_file" |
+			sort -t $'\t' -k6,6nr -k3,3
+	)
+}
+
 list_models() {
 	local -a filters
-	local model_dir snapshot_dir model_ref entries_file
-	local entry_name entry_path blob_path blob_id revision label
-	local size_bytes cached_epoch
-	local model_total_bytes model_total_h snapshot_count
-	local now_epoch
+	local model_dir snapshot_dir model_ref entries_file raw_entries_file
 	local first_model=1
 
 	filters=("$@")
-	now_epoch="$(current_time_epoch)"
 
 	while read -r model_dir; do
 		snapshot_dir="$model_dir/snapshots"
 		[ -d "$snapshot_dir" ] || continue
 		model_ref="$(display_model_ref "$(basename "$model_dir")")"
+		raw_entries_file="$(mktemp)"
 		entries_file="$(mktemp)"
 
-		while read -r entry_path; do
-			entry_name="$(basename "$entry_path")"
-			revision="$(basename "$(dirname "$entry_path")")"
-			blob_path="$(resolve_path "$entry_path")"
-			blob_id="$(basename "$blob_path")"
-			size_bytes="$(file_size_bytes "$blob_path")"
-			cached_epoch="$(file_mtime_epoch "$blob_path")"
-			label="$(artifact_label "$model_ref" "$entry_name")"
-
+		collect_entries_for_model "$(basename "$model_dir")" "$raw_entries_file"
+		while IFS=$'\t' read -r sort_key label blob_id revision size_bytes cached_epoch; do
 			if ! matches_filters "$model_ref" "$label" "${filters[@]}"; then
 				continue
 			fi
 
 			printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-				"$(artifact_sort_key "$label")" \
+				"$sort_key" \
 				"$label" \
 				"$blob_id" \
 				"$revision" \
 				"$size_bytes" \
 				"$cached_epoch" >>"$entries_file"
-		done < <(find "$snapshot_dir" -mindepth 2 -maxdepth 2 -type l -name '*.gguf' | sort)
+		done <"$raw_entries_file"
 
 		if [ ! -s "$entries_file" ]; then
+			rm -f "$raw_entries_file"
 			rm -f "$entries_file"
 			continue
 		fi
-
-		model_total_bytes="$(sum_unique_blob_bytes "$entries_file")"
-		model_total_h="$(human_size "$model_total_bytes")"
-		snapshot_count="$(count_unique_field "$entries_file" 4)"
 
 		if [ "$first_model" -eq 0 ]; then
 			safe_printf '\n'
 		fi
 		first_model=0
 
-		safe_printf "%s %s %s\n" \
-			"$(paint "$COLOR_MODEL" "$model_ref")" \
-			"$(paint "$COLOR_TOTAL_SIZE" "[$(printf '%8s' "$model_total_h")]")" \
-			"$(paint "$COLOR_SIZE" "[$(describe_snapshot_count "$snapshot_count")]")"
-
-		print_revisions_view "$entries_file" "$now_epoch"
-
+		print_model_entries_preview "$(basename "$model_dir")" "$entries_file"
+		rm -f "$raw_entries_file"
 		rm -f "$entries_file"
 	done < <(find "$CACHE_DIR" -mindepth 1 -maxdepth 1 -type d -name 'models--*' | sort)
 }
@@ -1039,16 +1228,44 @@ delete_blob_if_unreferenced() {
 	fi
 }
 
+delete_blob_path() {
+	local blob_path="$1"
+	local size_bytes
+
+	[ -e "$blob_path" ] || return 0
+	size_bytes="$(file_size_bytes "$blob_path")"
+	delete_path "$blob_path"
+	SUMMARY_BLOB_COUNT=$((SUMMARY_BLOB_COUNT + 1))
+	SUMMARY_RECLAIMED_BYTES=$((SUMMARY_RECLAIMED_BYTES + size_bytes))
+}
+
+delete_orphan_blobs_for_model() {
+	local model="$1"
+	local paths_file blob_path
+
+	paths_file="$(mktemp)"
+	collect_orphan_blob_paths_for_model "$model" "$paths_file"
+
+	while read -r blob_path; do
+		[ -n "$blob_path" ] || continue
+		delete_blob_path "$blob_path"
+	done <"$paths_file"
+
+	rm -f "$paths_file"
+}
+
 delete_link_paths_for_model() {
 	local model="$1"
 	local link_path blob_path
 
 	while read -r link_path; do
 		[ -n "$link_path" ] || continue
-		blob_path="$(resolve_path "$link_path")"
+		blob_path="$(resolve_path_or_empty "$link_path")"
 		delete_path "$link_path"
 		SUMMARY_LINK_COUNT=$((SUMMARY_LINK_COUNT + 1))
-		delete_blob_if_unreferenced "$model" "$blob_path" "$link_path"
+		if [ -n "$blob_path" ]; then
+			delete_blob_if_unreferenced "$model" "$blob_path" "$link_path"
+		fi
 	done
 }
 
@@ -1081,7 +1298,8 @@ snapshot_cache_epoch() {
 
 	while read -r link_path; do
 		[ -n "$link_path" ] || continue
-		blob_path="$(resolve_path "$link_path")"
+		blob_path="$(resolve_path_or_empty "$link_path")"
+		[ -n "$blob_path" ] || continue
 		cached_epoch="$(file_mtime_epoch "$blob_path")"
 		if [ "$found" -eq 0 ] || [ "$cached_epoch" -gt "$latest_epoch" ]; then
 			latest_epoch="$cached_epoch"
@@ -1091,6 +1309,26 @@ snapshot_cache_epoch() {
 
 	[ "$found" -eq 1 ] || return 1
 	printf '%s\n' "$latest_epoch"
+}
+
+collect_orphan_blob_candidates() {
+	local candidates_file="$1"
+	local model_dir model paths_file blob_path
+
+	: >"$candidates_file"
+
+	while read -r model_dir; do
+		model="$(basename "$model_dir")"
+		paths_file="$(mktemp)"
+		collect_orphan_blob_paths_for_model "$model" "$paths_file"
+
+		while read -r blob_path; do
+			[ -n "$blob_path" ] || continue
+			printf '%s\t%s\n' "$model" "$blob_path" >>"$candidates_file"
+		done <"$paths_file"
+
+		rm -f "$paths_file"
+	done < <(find "$CACHE_DIR" -mindepth 1 -maxdepth 1 -type d -name 'models--*' | sort)
 }
 
 collect_prune_candidates_until() {
@@ -1117,11 +1355,6 @@ collect_prune_candidates_until() {
 		done < <(find "$snapshot_root" -mindepth 1 -maxdepth 1 -type d | sort)
 	done < <(find "$CACHE_DIR" -mindepth 1 -maxdepth 1 -type d -name 'models--*' | sort)
 
-	if [ ! -s "$candidates_file" ]; then
-		printf 'No snapshots older than %s (%s).\n' \
-			"$until_spec" \
-			"$(format_local_timestamp "$until_epoch")"
-	fi
 }
 
 collect_prune_candidates_keep_latest() {
@@ -1155,25 +1388,24 @@ collect_prune_candidates_keep_latest() {
 		rm -f "$snapshot_file"
 	done < <(find "$CACHE_DIR" -mindepth 1 -maxdepth 1 -type d -name 'models--*' | sort)
 
-	if [ ! -s "$candidates_file" ]; then
-		printf 'No old snapshots to prune.\n'
-	fi
 }
 
 execute_prune_candidates() {
-	local candidates_file="$1"
-	local preview_title="$2"
-	local preview_details="$3"
-	local confirm_prompt="$4"
-	local candidate_count
+	local snapshot_candidates_file="$1"
+	local orphan_candidates_file="$2"
+	local preview_title="$3"
+	local preview_details="$4"
+	local confirm_prompt="$5"
+	local snapshot_count orphan_count
 	local touched_models_file
-	local model revision_dir
+	local model revision_dir blob_path
 
-	candidate_count="$(count_lines "$candidates_file")"
-	[ "$candidate_count" -gt 0 ] || return 0
+	snapshot_count="$(count_lines "$snapshot_candidates_file")"
+	orphan_count="$(count_lines "$orphan_candidates_file")"
+	[ $((snapshot_count + orphan_count)) -gt 0 ] || return 0
 
 	print_delete_candidates_heading "$preview_title" "$preview_details"
-	print_prune_candidates_preview "$candidates_file"
+	print_prune_candidates_preview "$snapshot_candidates_file" "$orphan_candidates_file"
 	safe_printf '\n'
 
 	reset_delete_summary
@@ -1183,7 +1415,13 @@ execute_prune_candidates() {
 		while IFS=$'\t' read -r model revision_dir _snapshot_epoch; do
 			delete_link_paths_for_model "$model" < <(find "$revision_dir" -mindepth 1 -maxdepth 1 -type l -name '*.gguf' | sort)
 			printf '%s\n' "$model" >>"$touched_models_file"
-		done <"$candidates_file"
+		done <"$snapshot_candidates_file"
+
+		while IFS=$'\t' read -r model blob_path; do
+			[ -n "$blob_path" ] || continue
+			delete_blob_path "$blob_path"
+			printf '%s\n' "$model" >>"$touched_models_file"
+		done <"$orphan_candidates_file"
 
 		while read -r model; do
 			[ -n "$model" ] || continue
@@ -1198,32 +1436,66 @@ execute_prune_candidates() {
 
 prune_snapshots() {
 	local until_spec="${1:-}"
-	local candidates_file candidate_count until_epoch
+	local candidates_file orphan_candidates_file
+	local snapshot_count orphan_count until_epoch
+	local preview_details confirm_prompt
 
 	candidates_file="$(mktemp)"
+	orphan_candidates_file="$(mktemp)"
+	collect_orphan_blob_candidates "$orphan_candidates_file"
+	orphan_count="$(count_lines "$orphan_candidates_file")"
 
 	if [ -n "$until_spec" ]; then
 		collect_prune_candidates_until "$until_spec" "$candidates_file"
-		candidate_count="$(count_lines "$candidates_file")"
-		if [ "$candidate_count" -gt 0 ]; then
+		snapshot_count="$(count_lines "$candidates_file")"
+		if [ "$snapshot_count" -gt 0 ] || [ "$orphan_count" -gt 0 ]; then
 			until_epoch="$(parse_until_epoch "$until_spec")" || die "invalid --until value: $until_spec"
-			execute_prune_candidates "$candidates_file" \
+			preview_details="Snapshots older than $(format_local_timestamp "$until_epoch")"
+			confirm_prompt="Delete prune candidates?"
+			if [ "$snapshot_count" -gt 0 ] && [ "$orphan_count" -gt 0 ]; then
+				preview_details="$preview_details plus unreferenced blobs"
+				confirm_prompt="Delete $snapshot_count snapshot(s) older than $(format_local_timestamp "$until_epoch") and $orphan_count unreferenced blob(s)?"
+			elif [ "$snapshot_count" -gt 0 ]; then
+				confirm_prompt="Delete $snapshot_count snapshot(s) older than $(format_local_timestamp "$until_epoch")?"
+			else
+				preview_details="Unreferenced blobs"
+				confirm_prompt="Delete $orphan_count unreferenced blob(s)?"
+			fi
+			execute_prune_candidates "$candidates_file" "$orphan_candidates_file" \
 				"Delete candidates" \
-				"Snapshots older than $(format_local_timestamp "$until_epoch")" \
-				"Delete $candidate_count snapshot(s) older than $(format_local_timestamp "$until_epoch")?"
+				"$preview_details" \
+				"$confirm_prompt"
+		else
+			printf 'No snapshots older than %s (%s) and no unreferenced blobs.\n' \
+				"$until_spec" \
+				"$(format_local_timestamp "$(parse_until_epoch "$until_spec")")"
 		fi
 	else
 		collect_prune_candidates_keep_latest "$candidates_file"
-		candidate_count="$(count_lines "$candidates_file")"
-		if [ "$candidate_count" -gt 0 ]; then
-			execute_prune_candidates "$candidates_file" \
+		snapshot_count="$(count_lines "$candidates_file")"
+		if [ "$snapshot_count" -gt 0 ] || [ "$orphan_count" -gt 0 ]; then
+			preview_details="Keeping the newest snapshot per model"
+			confirm_prompt="Delete prune candidates?"
+			if [ "$snapshot_count" -gt 0 ] && [ "$orphan_count" -gt 0 ]; then
+				preview_details="$preview_details and removing unreferenced blobs"
+				confirm_prompt="Delete $snapshot_count old snapshot(s), keeping the newest snapshot per model, and remove $orphan_count unreferenced blob(s)?"
+			elif [ "$snapshot_count" -gt 0 ]; then
+				confirm_prompt="Delete $snapshot_count old snapshot(s), keeping the newest snapshot per model?"
+			else
+				preview_details="Unreferenced blobs"
+				confirm_prompt="Delete $orphan_count unreferenced blob(s)?"
+			fi
+			execute_prune_candidates "$candidates_file" "$orphan_candidates_file" \
 				"Delete candidates" \
-				"Keeping the newest snapshot per model" \
-				"Delete $candidate_count old snapshot(s), keeping the newest snapshot per model?"
+				"$preview_details" \
+				"$confirm_prompt"
+		else
+			printf 'No old snapshots to prune and no unreferenced blobs.\n'
 		fi
 	fi
 
 	rm -f "$candidates_file"
+	rm -f "$orphan_candidates_file"
 }
 
 rm_quant_ref() {
@@ -1231,9 +1503,11 @@ rm_quant_ref() {
 	local model="$1"
 	local quant=""
 	local matches=0
+	local orphan_count=0
 	local link_path entry_name
 	local model_quant_ref model_ref
 	local matches_file entries_file
+	local preview_details confirm_prompt
 
 	model_quant_ref="$(split_model_quant_ref "$ref")"
 	model_ref="$(printf '%s\n' "$model_quant_ref" | sed -n '1p')"
@@ -1260,15 +1534,24 @@ rm_quant_ref() {
 	}
 
 	collect_entries_for_link_stream "$model" "$entries_file" <"$matches_file"
+	collect_orphan_blob_entries_for_model "$model" "$entries_file"
+	orphan_count="$(count_orphan_blob_entries "$entries_file")"
+	preview_details="Quant $quant in $(display_model_ref "$model")"
+	confirm_prompt="Delete $matches artifact(s) for quant $quant from $(display_model_ref "$model")?"
+	if [ "$orphan_count" -gt 0 ]; then
+		preview_details="$preview_details plus unreferenced blobs in this model"
+		confirm_prompt="Delete $matches artifact(s) for quant $quant from $(display_model_ref "$model") and remove $orphan_count unreferenced blob(s)?"
+	fi
 	print_single_model_delete_preview \
 		"Delete candidates" \
-		"Quant $quant in $(display_model_ref "$model")" \
+		"$preview_details" \
 		"$model" \
 		"$entries_file"
 
 	reset_delete_summary
-	if confirm "Delete $matches artifact(s) for quant $quant from $(display_model_ref "$model")?"; then
+	if confirm "$confirm_prompt"; then
 		delete_link_paths_for_model "$model" <"$matches_file"
+		delete_orphan_blobs_for_model "$model"
 		prune_empty_dirs "$model" 1
 		print_delete_summary
 	fi

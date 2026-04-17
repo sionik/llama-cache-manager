@@ -21,13 +21,13 @@ Options:
 Commands:
   completions             Print shell completion script to stdout
   help                    Show global or command-specific help
-  ls, list                List cached models and artifacts
-  prune                   Remove old snapshots
+  ls, list                List cached models, artifacts, and unreferenced blobs
+  prune                   Remove old snapshots and unreferenced blobs
   rm, remove              Remove MODEL or MODEL:QUANT from the cache
 ```
 
 Running `llama-cache-manager` without a command is equivalent to `llama-cache-manager ls`.
-Artifact rows include the local cache age derived from the blob mtime, for example `cached 7 days ago (on 2026-04-07 15:23)`.
+Artifact rows include the local cache age derived from the blob mtime, for example `cached 7 days ago (on 2026-04-07 15:23)`. Unreferenced files left behind in `blobs/` are listed separately under each model.
 
 ### Shell Completions
 
@@ -69,16 +69,16 @@ Color is enabled only on TTYs and can be disabled with `NO_COLOR=1`.
 
 Supported remove targets:
 
-- `rm MODEL`: Removes the whole model with all quants
-- `rm MODEL:QUANT`: Removes a single quant
+- `rm MODEL`: Removes the whole model with all quants and leftover blob files
+- `rm MODEL:QUANT`: Removes a single quant and also cleans unreferenced blobs in that model
 
 ### Prune Semantics
 
 `prune` without `--until` keeps only the newest snapshot revision per model and
-removes older revisions.
+removes older revisions. It also removes unreferenced files from `blobs/`.
 
 `prune --until SPEC` removes snapshot revisions whose newest referenced blob is
-older than the cutoff.
+older than the cutoff. Unreferenced files from `blobs/` are still included as prune candidates.
 
 Accepted cutoff formats include relative ages such as:
 
@@ -112,11 +112,13 @@ The tool expects a cache layout like this:
 ```
 
 The `.gguf` files under `snapshots/` are symlinks into `blobs/`.
+Regular files in `blobs/` without any snapshot symlink are treated as unreferenced leftovers and surfaced explicitly.
 
 That matters for deletion:
 
 - the tool removes snapshot symlinks first
 - then removes blobs only if they are no longer referenced
+- and it can clean unreferenced blob files that were never linked from a snapshot
 
 This avoids naive file deletion that would leave the cache in an inconsistent state.
 
