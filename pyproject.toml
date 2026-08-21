@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llama-cache-manager"
+version = "0.2.0"
+description = "Inspect and delete GGUF models in a llama.cpp or Hugging Face model cache"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Simon Richter", email = "simon@sinic.eu" }]
+keywords = ["llama.cpp", "gguf", "huggingface", "cache"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Utilities",
+]
+dependencies = [
+    # scan_cache_dir does the cache walk. click comes with it, and is named
+    # here as well because this program imports it directly.
+    "huggingface_hub>=1.0",
+    "click>=8.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.9"]
+
+[project.scripts]
+llama-cache-manager = "llama_cache_manager.cli:main"
+
+[project.urls]
+Repository = "https://github.com/sionik/llama-cache-manager"
+Issues = "https://github.com/sionik/llama-cache-manager/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["llama_cache_manager"]
+
+[tool.hatch.build.targets.sdist]
+# Everything needed to build, test and package, and nothing local.
+include = [
+    "llama_cache_manager",
+    "tests",
+    "docs",
+    "man",
+    "README.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RET", "PTH", "C4"]

@@ -1,145 +1,174 @@
 # llama-cache-manager
 
-Small Bash CLI for inspecting and deleting GGUF models from a `llama.cpp` / Hugging Face cache-style model store.
-It uses the same model reference format as llama.cpp's `-hf` option:
-`org/repo[:quant]`
+Inspect and delete GGUF models in a `llama.cpp` or Hugging Face model cache.
 
-- `unsloth/gpt-oss-20b-GGUF`
-- `unsloth/Qwen3.5-9B-GGUF:Q4_K_XL`
-
-## Usage
+Models are named the way huggingface.co and llama.cpp's `-hf` option name them,
+as `org/repo:quant`, so a reference can be copied between the three without
+translation:
 
 ```text
-Usage:
-  llama-cache-manager [OPTIONS] <command>
-
-Options:
-  -c DIR, --cache-dir DIR  Cache root. Default: LLAMA_CACHE or ~/.cache/llama.cpp
-  -h, --help               Show this help
-  -V, --version            Show version
-
-Commands:
-  completions             Print shell completion script to stdout
-  help                    Show global or command-specific help
-  ls, list                List cached models, artifacts, and unreferenced blobs
-  prune                   Remove old snapshots and unreferenced blobs
-  rm, remove              Remove MODEL or MODEL:QUANT from the cache
+unsloth/Qwen3.8-27B-GGUF
+unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL
 ```
 
-Running `llama-cache-manager` without a command is equivalent to `llama-cache-manager ls`.
-Artifact rows include the local cache age derived from the blob mtime, for example `cached 7 days ago (on 2026-04-07 15:23)`. Unreferenced files left behind in `blobs/` are listed separately under each model.
+The quant is the part of the file name that is not the repository name, which is
+the same string the hub shows for that file. Every shard of a split file shares
+one reference, so a model in three parts is one artifact.
 
-### Shell Completions
+## Listing
 
-Print completion scripts to stdout:
+`ls` is the default command, so the bare program lists everything:
 
-Examples:
+```text
+$ llama-cache-manager
+unsloth/gemma-4-12B-it-GGUF           10.1 GiB  1 revision
+  fc034cf  main  27 days ago
+    :UD-Q6_K_XL    10.0 GiB
+    :mmproj-BF16  167.0 MiB
+
+unsloth/Muse-Glimmer-30B-GGUF         16.7 GiB  2 revisions
+  1afeb8e  detached  10 days ago  shares all blobs
+    :UD-Q4_K_XL    14.8 GiB
+    :mmproj-Q8_0    1.9 GiB
+  faa5b02  main  10 days ago
+    :UD-Q4_K_XL    14.8 GiB
+    :mmproj-Q8_0    1.9 GiB
+
+67.8 GiB in 5 repositories, 6 revisions
+prune would remove 1 detached revision, reclaiming nothing
+```
+
+Read a reference down the tree: the repository on the first line, the `:quant`
+on the artifact line. The size next to a repository counts each file once, even
+when two revisions share it, which is why removing one of the two revisions
+above reclaims nothing.
+
+`detached` marks a revision that no name points at any more. Nothing can select
+it, so `prune` offers it first.
+
+Any part of a reference works as a filter, and the sizes then describe the rows
+shown:
+
+```text
+llama-cache-manager unsloth              every repository of one org
+llama-cache-manager ls :UD-Q4_K_XL       one quant, wherever it is
+llama-cache-manager ls unsloth/gemma-4-12B-it-GGUF
+llama-cache-manager ls --sort size       biggest first
+llama-cache-manager ls --sort age -r     oldest first
+llama-cache-manager ls --brief           one line per repository
+llama-cache-manager ls --json            byte counts and timestamps, unformatted
+```
+
+`--sort` takes `name`, `size` or `age`. `name` runs first letter first, the
+other two start with the largest and the newest, and `-r`/`--reverse` turns
+that around. `--brief` drops to one line per repository.
+
+## Removing
+
+Every command that deletes prints the plan first, then asks. `--dry-run` prints
+the plan and stops. `--yes` skips the question.
+
+```text
+llama-cache-manager rm unsloth/Qwen3.8-27B-GGUF                 the repository
+llama-cache-manager rm unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL      one quant
+llama-cache-manager rm -n unsloth/Qwen3.8-27B-GGUF:mmproj-BF16  plan only
+llama-cache-manager rm --until 30d unsloth/Qwen3.8-27B-GGUF     old revisions only
+```
+
+A shorter word is accepted while it fits one repository, and named candidates
+come back when it fits several. `remove` and `list` work as the older names of
+`rm` and `ls`, and `help COMMAND` prints the help of one command.
+
+`--until` holds the removal to the revisions older than the cutoff, which is
+`prune --until` restricted to the repositories named.
+
+`--json` prints the plan as data. Since nothing is watching, it removes only
+with `-y`, and `-n` gives the plan alone. The fields are written down in
+[`docs/json-schema.md`](docs/json-schema.md).
+
+What the plan says it reclaims is what the file system gives back. A blob is
+counted only when every entry that points at it is going away, so deleting a
+quant that another revision still uses reports that it reclaims nothing.
+
+## Pruning
+
+`prune` removes what nothing can reach any more:
+
+- revisions no name points at
+- blobs no revision points at
+- interrupted downloads
+
+None of these can be selected by `org/repo`, so removing them takes nothing
+away.
+
+`--until` goes further and reaches revisions that are still in use:
+
+```text
+llama-cache-manager prune                     only unreachable files
+llama-cache-manager prune -n                  what that would be
+llama-cache-manager prune --until 30d         also anything older than 30 days
+llama-cache-manager prune --until "2 weeks"
+llama-cache-manager prune --until 2026-07-01
+```
+
+Ages come from the modification time of the file, which is when it was
+downloaded. Access times are not used, because mount options such as
+`relatime` make them unreliable.
+
+## Where the cache is
+
+In order: `--cache-dir`, `$LLAMA_CACHE`, `$HF_HOME/llama.cpp` when it exists,
+`~/.cache/llama.cpp` when it exists, then the Hugging Face hub cache, which
+follows `$HF_HUB_CACHE` and `$HF_HOME`.
+
+## Install
+
+```text
+pipx install llama-cache-manager
+```
+
+or from a clone:
+
+```text
+pipx install .
+```
+
+The only dependency is `huggingface_hub`, which does the cache walk, and the
+`click` it brings along.
+
+## Shell completions
+
+The script is generated by the program, so nothing has to be installed
+alongside it:
 
 ```text
 source <(llama-cache-manager completions bash)
-llama-cache-manager completions zsh > ~/.zfunc/_llama-cache-manager
+llama-cache-manager completions zsh  > ~/.zfunc/_llama-cache-manager
 llama-cache-manager completions fish > ~/.config/fish/completions/llama-cache-manager.fish
 ```
 
-The repository also contains the raw completion files under
-[`completions/`](./completions).
+Completion offers references, `org/repo` and `org/repo:quant` alike, read from
+the cache as you type.
 
-### Examples
+## Exit codes
 
-```text
-llama-cache-manager ls
-llama-cache-manager --version
-llama-cache-manager ls unsloth
-llama-cache-manager ls :UD-Q4_K_XL
-llama-cache-manager completions bash
-llama-cache-manager prune
-llama-cache-manager prune --until "7 days"
-llama-cache-manager prune --dry-run --until 3days
-llama-cache-manager rm -f unsloth/gpt-oss-20b-GGUF
-llama-cache-manager remove --dry-run unsloth/Qwen3.5-9B-GGUF:Q4_K_XL
-llama-cache-manager -c /srv/llama-models list
-llama-cache-manager help rm
-```
+| Code | Meaning |
+| ---- | ------- |
+| 0 | done |
+| 1 | error |
+| 2 | wrong usage |
+| 3 | nothing matched, or no cache directory (also with `--json`) |
+| 4 | cancelled at the prompt |
 
-### Color
+## Documentation
 
-Color is enabled only on TTYs and can be disabled with `NO_COLOR=1`.
+`man llama-cache-manager` once installed, or `man -l man/llama-cache-manager.1`
+from a clone. The JSON fields are in [`docs/json-schema.md`](docs/json-schema.md).
 
-### Remove Semantics
-
-Supported remove targets:
-
-- `rm MODEL`: Removes the whole model with all quants and leftover blob files
-- `rm MODEL:QUANT`: Removes a single quant and also cleans unreferenced blobs in that model
-
-### Prune Semantics
-
-`prune` without `--until` keeps only the newest snapshot revision per model and
-removes older revisions. It also removes unreferenced files from `blobs/`.
-
-`prune --until SPEC` removes snapshot revisions whose newest referenced blob is
-older than the cutoff. Unreferenced files from `blobs/` are still included as prune candidates.
-
-Accepted cutoff formats include relative ages such as:
-
-- `7 days`
-- `3days`
-- `12h`
-
-Absolute timestamps such as `2026-04-01` or `2026-04-01 12:30` are also accepted.
-
-### List Filters
-
-`ls` accepts optional filters.
-
-- plain text matches against `org/repo`
-- `:QUANT` matches against quant labels
-- `org/repo:QUANT` matches the full reference
-
-Multiple filters are combined with OR.
-
-## Technical Notes
-### Cache Layout
-
-The tool expects a cache layout like this:
+## Tests
 
 ```text
-<cache-root>/
-  models--<org>--<repo>/
-    blobs/
-    refs/
-    snapshots/<revision>/*.gguf
+python -m pytest
+ruff check llama_cache_manager tests
+ruff format --check llama_cache_manager tests
 ```
-
-The `.gguf` files under `snapshots/` are symlinks into `blobs/`.
-Regular files in `blobs/` without any snapshot symlink are treated as unreferenced leftovers and surfaced explicitly.
-
-That matters for deletion:
-
-- the tool removes snapshot symlinks first
-- then removes blobs only if they are no longer referenced
-- and it can clean unreferenced blob files that were never linked from a snapshot
-
-This avoids naive file deletion that would leave the cache in an inconsistent state.
-
-### Defaults
-
-Cache root resolution:
-
-1. `LLAMA_CACHE`, if set
-2. otherwise `${HF_HOME:-$HOME/.cache}/llama.cpp`
-
-### Notes For Future Changes
-
-- This tool intentionally works at two user-facing levels only:
-  model and quant within a model.
-- It does not expose direct removal of arbitrary artifact names.
-- `mmproj` is listed because it is relevant for multimodal models, but it is not currently an addressable `rm` target.
-- Quant detection is filename-based and currently assumes names
-  like `...-Q4_K_XL.gguf` or `...-BF16.gguf`.
-- If naming conventions change, the parsing logic in
-  [`llama-cache-manager`](./llama-cache-manager) will
-  need to be updated.
-- If multiple snapshots of the same model are present,
-  blob deletion remains reference-aware within that model
-  directory. The tool does not rewrite `refs`.
