@@ -20,7 +20,7 @@ from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from huggingface_hub import scan_cache_dir
 from huggingface_hub.errors import CacheNotFound
@@ -47,7 +47,12 @@ class Kind(Enum):
         return {Kind.MODEL: 0, Kind.PROJECTOR: 1, Kind.EXTRA: 2}[self]
 
 
-def _kind_of(quant: str) -> Kind:
+def kind_of(quant: str) -> Kind:
+    """What an artifact with this quant label is for.
+
+    Read from the label rather than from the file, because ``pull`` decides the
+    same thing for a file it has not downloaded yet.
+    """
     lowered = quant.lower()
     if lowered.startswith("mmproj"):
         return Kind.PROJECTOR
@@ -276,8 +281,7 @@ def scan(cache_dir: Path) -> Cache:
 
 
 def _revision_of(repo_id: str, hub_revision) -> Revision:
-    groups: dict[str, list[tuple[Path, Blob]]] = {}
-    labels: dict[str, str] = {}
+    gguf: dict[str, tuple[Path, Blob]] = {}
     others: list[Path] = []
     other_blobs: list[Blob] = []
 
@@ -293,21 +297,19 @@ def _revision_of(repo_id: str, hub_revision) -> Revision:
             continue
         # The hub reports the base name only, and a snapshot may hold two files
         # of that name in different directories. The path inside the snapshot is
-        # what tells them apart.
-        inside = PurePosixPath(hub_file.file_path.relative_to(hub_revision.snapshot_path).as_posix())
-        key = _file_key(inside)
-        labels[key] = refs.quant_of_file(repo_id, inside.name)
-        groups.setdefault(key, []).append((hub_file.file_path, blob))
+        # what tells them apart, and it is also the name the hub itself uses for
+        # the file, so the grouping is the same one ``pull`` applies remotely.
+        inside = hub_file.file_path.relative_to(hub_revision.snapshot_path).as_posix()
+        gguf[inside] = (hub_file.file_path, blob)
 
-    # A label that two files of different names would share must address
-    # neither of them, so those files keep their path instead.
-    label_users = Counter(labels.values())
-    artifacts = []
-    for key, pairs in groups.items():
-        label = labels[key] if label_users[labels[key]] == 1 else key
-        artifacts.append(
-            _artifact(label, tuple(entry for entry, _ in pairs), tuple(blob for _, blob in pairs))
+    artifacts = [
+        _artifact(
+            label,
+            tuple(gguf[name][0] for name in names),
+            tuple(gguf[name][1] for name in names),
         )
+        for label, names in refs.group_by_artifact(repo_id, gguf).items()
+    ]
 
     artifacts.sort(key=lambda artifact: (artifact.kind.order, artifact.quant.lower()))
     return Revision(
@@ -321,20 +323,8 @@ def _revision_of(repo_id: str, hub_revision) -> Revision:
     )
 
 
-def _file_key(inside: PurePosixPath) -> str:
-    """What makes one artifact, shards counted as one file."""
-    stem = _shardless_stem(inside.name)
-    parent = inside.parent
-    return stem if str(parent) == "." else f"{parent}/{stem}"
-
-
 def _artifact(quant: str, entries: tuple[Path, ...], blobs: tuple[Blob, ...]) -> Artifact:
-    return Artifact(quant=quant, kind=_kind_of(quant), entries=entries, blobs=blobs)
-
-
-def _shardless_stem(file_name: str) -> str:
-    stem = file_name[: -len(".gguf")] if refs.is_gguf(file_name) else file_name
-    return refs._SHARD_SUFFIX.sub("", stem)
+    return Artifact(quant=quant, kind=kind_of(quant), entries=entries, blobs=blobs)
 
 
 def _strays_of(repo_path: Path, references: Counter[Path]) -> tuple[Blob, ...]:

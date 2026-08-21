@@ -7,7 +7,10 @@ option, so a reference can be copied between the three without translation.
 from __future__ import annotations
 
 import re
+from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 
 CACHE_PREFIX = "models--"
 
@@ -168,3 +171,42 @@ def _base_name_prefixes(base: str) -> list[str]:
         return []
     shortest = 1 if len(segments) == 1 else 2
     return ["-".join(segments[:count]) for count in range(len(segments), shortest - 1, -1)]
+
+
+def _artifact_key(name: str) -> str:
+    """What makes one artifact out of a file name, shards counted as one file.
+
+    ``name`` is a path inside the repository, with ``/`` as the separator. The
+    directory stays part of the key, because a repository may hold two files of
+    the same name in different directories.
+    """
+    inside = PurePosixPath(name)
+    stem = inside.name[: -len(_GGUF_SUFFIX)] if is_gguf(inside.name) else inside.name
+    stem = _SHARD_SUFFIX.sub("", stem)
+    parent = inside.parent
+    return stem if str(parent) == "." else f"{parent}/{stem}"
+
+
+def group_by_artifact(repo_id: str, file_names: Iterable[str]) -> dict[str, tuple[str, ...]]:
+    """Group the GGUF files of one repository into addressable artifacts.
+
+    The same mapping serves a cached revision and a file list read from the
+    hub, so ``pull`` and ``ls`` name the same artifact the same way.
+
+    Names that are not GGUF files are left out. A label that two files of
+    different names would share addresses neither of them, and those files keep
+    their path as the label instead.
+    """
+    groups: dict[str, list[str]] = {}
+    labels: dict[str, str] = {}
+    for name in sorted(file_names):
+        if not is_gguf(name):
+            continue
+        key = _artifact_key(name)
+        labels[key] = quant_of_file(repo_id, PurePosixPath(name).name)
+        groups.setdefault(key, []).append(name)
+
+    label_users = Counter(labels.values())
+    return {
+        (labels[key] if label_users[labels[key]] == 1 else key): tuple(names) for key, names in groups.items()
+    }

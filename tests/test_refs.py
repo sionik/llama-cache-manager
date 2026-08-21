@@ -92,3 +92,39 @@ class TestFolderNames:
     def test_rejects_a_folder_without_an_org(self):
         with pytest.raises(ReferenceError):
             refs.repo_id_of_folder("models--onlyname")
+
+
+class TestGroupByArtifact:
+    def test_puts_every_shard_of_a_split_file_under_one_label(self):
+        groups = refs.group_by_artifact(
+            "unsloth/Big-30B-GGUF",
+            [
+                "Big-30B-UD-Q4_K_XL-00002-of-00002.gguf",
+                "Big-30B-UD-Q4_K_XL-00001-of-00002.gguf",
+            ],
+        )
+
+        assert groups == {
+            "UD-Q4_K_XL": (
+                "Big-30B-UD-Q4_K_XL-00001-of-00002.gguf",
+                "Big-30B-UD-Q4_K_XL-00002-of-00002.gguf",
+            )
+        }
+
+    def test_leaves_out_what_is_not_a_gguf_file(self):
+        groups = refs.group_by_artifact(
+            "unsloth/Big-30B-GGUF", ["README.md", "config.json", "Big-30B-Q4_K_M.gguf"]
+        )
+
+        assert list(groups) == ["Q4_K_M"]
+
+    def test_keeps_the_path_when_two_files_would_share_a_label(self):
+        # Both file names reduce to the same quant, so neither may own it.
+        groups = refs.group_by_artifact("unsloth/Big-30B-GGUF", ["Q4_K_M/Big-30B.gguf", "spare/Big-30B.gguf"])
+
+        assert sorted(groups) == ["Q4_K_M/Big-30B", "spare/Big-30B"]
+
+    def test_reads_a_quant_that_sits_in_its_own_directory(self):
+        groups = refs.group_by_artifact("unsloth/Big-30B-GGUF", ["UD-Q4_K_XL/Big-30B-UD-Q4_K_XL.gguf"])
+
+        assert list(groups) == ["UD-Q4_K_XL"]
