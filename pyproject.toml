@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "llama-cache-manager"
 version = "0.2.0"
-description = "Inspect and delete GGUF models in a llama.cpp or Hugging Face model cache"
+description = "Fetch, inspect and delete GGUF models in a llama.cpp or Hugging Face model cache"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

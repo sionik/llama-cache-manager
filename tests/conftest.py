@@ -68,3 +68,58 @@ def fake_cache(tmp_path: Path) -> FakeCache:
 
 COMMIT_A = "a" * 40
 COMMIT_B = "b" * 40
+
+
+class FakeHub:
+    """A hub holding a few repositories, standing in for the network.
+
+    ``repos`` maps ``org/repo`` to ``{"commit": hash, "files": {name: size}}``.
+    Every call is recorded, so a test can say what was asked for as well as
+    what came back. With a ``cache`` given, :meth:`fetch` writes the file into
+    that cache the way a real download would, which lets a test pull and then
+    list.
+    """
+
+    def __init__(self, repos: dict, cache: FakeCache | None = None, cached=()) -> None:
+        self.repos = repos
+        self.cache = cache
+        self.cached = set(cached)
+        self.fetched: list[tuple[str, str]] = []
+        self.listed: list[str] = []
+        self.reachable = True
+
+    def _repo(self, repo_id: str, revision: str) -> dict:
+        from llama_cache_manager.download import DownloadError
+
+        if not self.reachable:
+            raise DownloadError(f"cannot reach the hub for {repo_id}: no route to host")
+        if repo_id not in self.repos:
+            raise DownloadError(f"no repository {repo_id} on the hub")
+        return self.repos[repo_id]
+
+    def file_names(self, repo_id: str, revision: str) -> tuple[str, ...]:
+        files = self._repo(repo_id, revision)["files"]
+        self.listed.append(repo_id)
+        return tuple(files)
+
+    def inspect(self, repo_id: str, name: str, revision: str, cache_dir: Path):
+        from llama_cache_manager.download import FileStatus
+
+        repo = self._repo(repo_id, revision)
+        return FileStatus(
+            name=name,
+            size=repo["files"][name],
+            commit=repo["commit"],
+            cached=name in self.cached or (repo_id, name) in self.fetched,
+        )
+
+    def fetch(self, repo_id: str, name: str, revision: str, cache_dir: Path) -> Path:
+        repo = self._repo(repo_id, revision)
+        self.fetched.append((repo_id, name))
+        if self.cache is None:
+            return cache_dir / name
+        blob_name = f"{repo['commit'][:6]}-{Path(name).name}"
+        self.cache.blob(repo_id, blob_name, repo["files"][name])
+        path = self.cache.link(repo_id, repo["commit"], name, blob_name)
+        self.cache.ref(repo_id, repo["commit"])
+        return path

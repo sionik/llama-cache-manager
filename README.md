@@ -1,6 +1,7 @@
 # llama-cache-manager
 
-Inspect and delete GGUF models in a `llama.cpp` or Hugging Face model cache.
+Fetch, inspect and delete GGUF models in a `llama.cpp` or Hugging Face model
+cache.
 
 Models are named the way huggingface.co and llama.cpp's `-hf` option name them,
 as `org/repo:quant`, so a reference can be copied between the three without
@@ -63,6 +64,45 @@ llama-cache-manager ls --json            byte counts and timestamps, unformatted
 other two start with the largest and the newest, and `-r`/`--reverse` turns
 that around. `--brief` drops to one line per repository.
 
+## Fetching
+
+`pull` fetches one quant from the hub into the same cache the other commands
+read:
+
+```text
+$ llama-cache-manager pull unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL
+About to download into /home/simon/.cache/llama.cpp
+
+unsloth/Qwen3.8-27B-GGUF  main  1a2b3c4
+  :UD-Q4_K_XL  14.8 GiB  2 shards
+
+Transfers 14.8 GiB
+
+Download these? [y/N]:
+```
+
+The quant has to be named. The hub cannot be searched from here, and the quants
+of one repository differ by tens of gigabytes, so a reference without one comes
+back with the choices named:
+
+```text
+$ llama-cache-manager pull unsloth/Qwen3.8-27B-GGUF
+Error: unsloth/Qwen3.8-27B-GGUF needs a quant to fetch; it offers UD-Q4_K_XL, mmproj-BF16
+```
+
+What the plan calls a transfer is what has to come over the network. A file the
+cache already holds is not fetched again, so pulling the projector next to a
+model it shares files with reports only what is new:
+
+```text
+llama-cache-manager pull -n unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL   what it would cost
+llama-cache-manager pull --revision v1.2 unsloth/Qwen3.8-27B-GGUF:Q4_K_M
+llama-cache-manager pull -y unsloth/Qwen3.8-27B-GGUF:mmproj-BF16  do not ask
+```
+
+A gated or private repository needs a token, which `huggingface_hub` reads from
+`HF_TOKEN` or from the file `hf auth login` writes.
+
 ## Removing
 
 Every command that deletes prints the plan first, then asks. `--dry-run` prints
@@ -121,6 +161,11 @@ In order: `--cache-dir`, `$LLAMA_CACHE`, `$HF_HOME/llama.cpp` when it exists,
 `~/.cache/llama.cpp` when it exists, then the Hugging Face hub cache, which
 follows `$HF_HUB_CACHE` and `$HF_HOME`.
 
+`pull` writes into the cache the other commands read, so a pull and the listing
+that follows it cannot land in different places. The one case where it differs
+is a machine with no cache at all: there `pull` creates `~/.cache/llama.cpp`
+rather than the hub cache, because that is the one `llama-server -hf` reads.
+
 ## Install
 
 ```text
@@ -133,8 +178,8 @@ or from a clone:
 pipx install .
 ```
 
-The only dependency is `huggingface_hub`, which does the cache walk, and the
-`click` it brings along.
+The only dependency is `huggingface_hub`, which does the cache walk and the
+transfers, and the `click` it brings along.
 
 ## Shell completions
 

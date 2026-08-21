@@ -14,6 +14,7 @@ from typing import TextIO
 
 from . import age
 from .cache import Artifact, Blob, Cache, Kind, Repo, Revision
+from .download import Download, DownloadPlan
 from .removal import Item, Plan, Reason
 
 SCHEMA_VERSION = 1
@@ -426,4 +427,97 @@ def plan_as_json(plan: Plan, dry_run: bool) -> dict:
         "revisions": [str(path) for path in plan.revision_dirs],
         "repositories": [str(path) for path in plan.repo_dirs],
         "withheld": [str(path) for path in plan.withheld],
+    }
+
+
+def render_download_plan(plan: DownloadPlan, style: Style, dry_run: bool, out: TextIO) -> None:
+    """Print what a download would fetch, grouped the way ``ls`` groups."""
+    heading = "Would download into" if dry_run else "About to download into"
+    print(f"{style.paint(style.repo, heading)} {style.paint(style.dim, str(plan.cache_dir))}", file=out)
+    print(file=out)
+
+    labels = ["  :" + item.quant for item in plan.downloads]
+    sizes = [item.size for item in plan.downloads]
+    layout = Layout.measure(list(plan.repo_ids), labels, sizes)
+
+    for repo_id in plan.repo_ids:
+        for index, item in enumerate(item for item in plan.downloads if item.repo_id == repo_id):
+            if index == 0:
+                print(
+                    f"{style.paint(style.repo, repo_id)}"
+                    f"  {style.paint(style.dim, item.revision)}"
+                    f"  {style.paint(style.revision, item.commit[:7])}",
+                    file=out,
+                )
+            _print_download(item, style, layout, out)
+        print(file=out)
+
+    print(style.paint(style.total, _download_summary(plan)), file=out)
+    detail = _download_detail(plan)
+    if detail:
+        print(style.paint(style.dim, detail), file=out)
+
+
+def _print_download(item: Download, style: Style, layout: Layout, out: TextIO) -> None:
+    label = ("  :" + item.quant).ljust(layout.artifact)
+    line = f"{style.paint(style.for_kind(item.kind), label)}"
+    line += f"  {style.paint(style.dim, human_size(item.size).rjust(layout.size))}"
+    if item.shards > 1:
+        line += f"  {style.paint(style.dim, count(item.shards, 'shard'))}"
+    if item.cached:
+        line += f"  {style.paint(style.dim, 'already in the cache')}"
+    elif item.transfer < item.size:
+        line += f"  {style.paint(style.dim, human_size(item.transfer) + ' to fetch')}"
+    print(line, file=out)
+
+
+def _download_summary(plan: DownloadPlan) -> str:
+    if plan.transfer == 0:
+        return "Transfers nothing, every file is already in the cache"
+    if plan.transfer == plan.size:
+        return f"Transfers {human_size(plan.transfer)}"
+    return f"Transfers {human_size(plan.transfer)} of {human_size(plan.size)}"
+
+
+def _download_detail(plan: DownloadPlan) -> str:
+    """What the list above does not already say.
+
+    A single artifact needs no total: its row already carries the size and the
+    shard count.
+    """
+    if len(plan.downloads) < 2:
+        return ""
+    parts = [count(len(plan.downloads), "artifact")]
+    files = sum(item.shards for item in plan.downloads)
+    if files != len(plan.downloads):
+        parts.append(count(files, "file"))
+    return ", ".join(parts)
+
+
+def download_plan_as_json(plan: DownloadPlan, dry_run: bool) -> dict:
+    """A download as data, so a script can check the size before agreeing."""
+    return {
+        "schema": SCHEMA_VERSION,
+        "dry_run": dry_run,
+        "cache_dir": str(plan.cache_dir),
+        "size": plan.size,
+        "transfer": plan.transfer,
+        "downloads": [
+            {
+                "reference": item.reference,
+                "repo_id": item.repo_id,
+                "revision": item.revision,
+                "commit": item.commit,
+                "quant": item.quant,
+                "kind": item.kind.value,
+                "size": item.size,
+                "transfer": item.transfer,
+                "shards": item.shards,
+                "cached": item.cached,
+                "files": [
+                    {"name": file.name, "size": file.size, "cached": file.cached} for file in item.files
+                ],
+            }
+            for item in plan.downloads
+        ],
     }

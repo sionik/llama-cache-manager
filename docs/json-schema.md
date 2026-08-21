@@ -122,6 +122,73 @@ else.
 | `quant` | string or null | the quant, where the item names one |
 | `nominal_size` | integer | bytes of the item on its own |
 
+## `pull --json`
+
+The download, before anything is fetched. With `-n` it is only printed. Without
+`-n` it needs `-y` as well, for the same reason the removal commands do.
+
+```json
+{
+  "schema": 1,
+  "dry_run": true,
+  "cache_dir": "/srv/llama-models",
+  "size": 15869711974,
+  "transfer": 7301444403,
+  "downloads": [
+    {
+      "reference": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL",
+      "repo_id": "unsloth/Qwen3.8-27B-GGUF",
+      "revision": "main",
+      "commit": "1a2b3c4d...",
+      "quant": "UD-Q4_K_XL",
+      "kind": "model",
+      "size": 15869711974,
+      "transfer": 7301444403,
+      "shards": 2,
+      "cached": false,
+      "files": [
+        {
+          "name": "Qwen3.8-27B-UD-Q4_K_XL-00001-of-00002.gguf",
+          "size": 8568267571,
+          "cached": true
+        }
+      ]
+    }
+  ]
+}
+```
+
+| Field | Type | Meaning |
+| ----- | ---- | ------- |
+| `schema` | integer | version of this document |
+| `dry_run` | boolean | whether `-n` was given |
+| `cache_dir` | string | where the files would land, which may not exist yet |
+| `size` | integer | bytes the download holds once it is in the cache |
+| `transfer` | integer | bytes that have to come over the network |
+| `downloads` | array | one entry per artifact, in the order the references were given |
+
+`transfer` is the number to act on. `size` is larger whenever the cache already
+holds part of the artifact.
+
+### download
+
+| Field | Type | Meaning |
+| ----- | ---- | ------- |
+| `reference` | string | `org/repo:quant`, the same string `ls` prints |
+| `repo_id` | string | `org/repo` |
+| `revision` | string | what `--revision` asked for, such as `main` |
+| `commit` | string | the commit that revision resolved to |
+| `quant` | string | the quant part of the reference |
+| `kind` | string | `model`, `projector` or `extra` |
+| `size` | integer | bytes of the artifact |
+| `transfer` | integer | bytes of it that are not cached yet |
+| `shards` | integer | files making up this artifact, above 1 for a split file |
+| `cached` | boolean | every file is there already, so this fetches nothing |
+| `files` | array | one entry per file, each `{name, size, cached}` |
+
+`name` is the path of the file inside the repository, which is what the hub
+calls it.
+
 ## Exit codes
 
 `--json` writes its document first and then exits with the usual code, so

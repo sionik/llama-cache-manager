@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
-from conftest import COMMIT_A, COMMIT_B
+from conftest import COMMIT_A, COMMIT_B, FakeHub
 
 from llama_cache_manager.cli import (
     EXIT_CANCELLED,
+    EXIT_ERROR,
     EXIT_NO_MATCH,
     EXIT_OK,
     EXIT_USAGE,
@@ -285,6 +287,63 @@ class TestDefaultCacheDir:
         assert default_cache_dir() == under_hf_home
 
 
+class TestDefaultDownloadDir:
+    """Where a pull lands, which is not quite where a listing looks.
+
+    A reader takes whichever cache exists. A writer has to agree with it, and
+    has to pick something sensible when there is no cache at all.
+    """
+
+    @pytest.fixture
+    def unset(self, monkeypatch, tmp_path):
+        """A home with no cache in it, and no environment pointing anywhere.
+
+        The hub cache is a constant the library resolves when it is imported, so
+        moving HOME alone would leave it pointing at the real one.
+        """
+        import huggingface_hub.constants
+
+        home = tmp_path / "home"
+        for name in ("LLAMA_CACHE", "HF_HOME", "HF_HUB_CACHE"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setattr(Path, "home", lambda: home)
+        monkeypatch.setattr(
+            huggingface_hub.constants, "HF_HUB_CACHE", str(home / ".cache" / "huggingface" / "hub")
+        )
+        return home
+
+    def test_obeys_llama_cache_even_before_it_exists(self, monkeypatch, tmp_path, unset):
+        from llama_cache_manager.cli import default_download_dir
+
+        monkeypatch.setenv("LLAMA_CACHE", str(tmp_path / "asked-for"))
+
+        assert default_download_dir() == tmp_path / "asked-for"
+
+    def test_writes_into_the_cache_a_listing_reads(self, unset):
+        # A hub cache holding models is the cache of this machine. Writing
+        # somewhere else would hide the pull from ls and fetch it again next time.
+        from llama_cache_manager.cli import default_cache_dir, default_download_dir
+
+        hub_cache = unset / ".cache" / "huggingface" / "hub"
+        hub_cache.mkdir(parents=True)
+
+        assert default_download_dir() == default_cache_dir() == hub_cache
+
+    def test_creates_the_llama_cpp_cache_when_there_is_none_at_all(self, unset):
+        # That is the one llama.cpp reads with -hf, so a model pulled into the
+        # hub cache instead would be downloaded a second time by llama-server.
+        from llama_cache_manager.cli import default_download_dir
+
+        assert default_download_dir() == unset / ".cache" / "llama.cpp"
+
+    def test_puts_a_first_download_under_hf_home_when_that_is_set(self, monkeypatch, tmp_path, unset):
+        from llama_cache_manager.cli import default_download_dir
+
+        monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+
+        assert default_download_dir() == tmp_path / "hf" / "llama.cpp"
+
+
 class TestOrder:
     @pytest.fixture
     def three_repos(self, fake_cache):
@@ -496,3 +555,104 @@ class TestModuleRoute:
         )
 
         assert result.stdout.startswith("Usage: llama-cache-manager")
+
+
+class TestPull:
+    """Fetching from the hub, with the hub faked out."""
+
+    FILES = {
+        "Foo-30B-UD-Q4_K_XL-00001-of-00002.gguf": 300,
+        "Foo-30B-UD-Q4_K_XL-00002-of-00002.gguf": 200,
+        "mmproj-Foo-30B-BF16.gguf": 70,
+        "README.md": 5,
+    }
+
+    @pytest.fixture
+    def hub(self, fake_cache):
+        return FakeHub({REPO: {"commit": COMMIT_A, "files": dict(self.FILES)}}, cache=fake_cache)
+
+    def pull(self, runner, cache, hub, *args, **kwargs):
+        return runner.invoke(
+            main,
+            ["-c", str(cache.root), "--color", "never", "pull", *args],
+            obj={"hub": hub},
+            **kwargs,
+        )
+
+    def test_fetches_every_shard_after_the_answer_is_yes(self, runner, fake_cache, hub):
+        result = self.pull(runner, fake_cache, hub, f"{REPO}:UD-Q4_K_XL", input="y\n")
+
+        assert result.exit_code == EXIT_OK
+        assert [name for _, name in hub.fetched] == [
+            "Foo-30B-UD-Q4_K_XL-00001-of-00002.gguf",
+            "Foo-30B-UD-Q4_K_XL-00002-of-00002.gguf",
+        ]
+
+    def test_shows_the_plan_and_fetches_nothing_with_dry_run(self, runner, fake_cache, hub):
+        result = self.pull(runner, fake_cache, hub, "-n", f"{REPO}:UD-Q4_K_XL")
+
+        assert result.exit_code == EXIT_OK
+        assert ":UD-Q4_K_XL" in result.output
+        assert hub.fetched == []
+
+    def test_fetches_nothing_when_the_answer_is_no(self, runner, fake_cache, hub):
+        result = self.pull(runner, fake_cache, hub, f"{REPO}:UD-Q4_K_XL", input="n\n")
+
+        assert result.exit_code == EXIT_CANCELLED
+        assert hub.fetched == []
+
+    def test_asks_nothing_when_every_file_is_already_in_the_cache(self, runner, fake_cache):
+        hub = FakeHub(
+            {REPO: {"commit": COMMIT_A, "files": dict(self.FILES)}},
+            cache=fake_cache,
+            cached=list(self.FILES),
+        )
+
+        result = self.pull(runner, fake_cache, hub, f"{REPO}:UD-Q4_K_XL")
+
+        assert result.exit_code == EXIT_OK
+        assert "already in the cache" in result.output.lower()
+
+    def test_names_the_available_quants_when_the_reference_carries_none(self, runner, fake_cache, hub):
+        result = self.pull(runner, fake_cache, hub, REPO)
+
+        assert result.exit_code == EXIT_NO_MATCH
+        assert "UD-Q4_K_XL" in result.output
+        assert hub.fetched == []
+
+    def test_reports_a_hub_it_cannot_reach_as_an_error(self, runner, fake_cache, hub):
+        hub.reachable = False
+
+        result = self.pull(runner, fake_cache, hub, f"{REPO}:UD-Q4_K_XL")
+
+        assert result.exit_code == EXIT_ERROR
+
+    def test_refuses_a_json_run_that_neither_previews_nor_agrees(self, runner, fake_cache, hub):
+        result = self.pull(runner, fake_cache, hub, "--json", f"{REPO}:UD-Q4_K_XL")
+
+        assert result.exit_code == EXIT_USAGE
+        assert hub.fetched == []
+
+    def test_prints_the_plan_as_json(self, runner, fake_cache, hub):
+        result = self.pull(runner, fake_cache, hub, "--json", "-n", f"{REPO}:UD-Q4_K_XL")
+
+        assert result.exit_code == EXIT_OK
+        report = json.loads(result.output)
+        assert report["downloads"][0]["reference"] == f"{REPO}:UD-Q4_K_XL"
+        assert report["downloads"][0]["shards"] == 2
+        assert report["transfer"] == 500
+        assert hub.fetched == []
+
+    def test_lists_what_it_pulled(self, runner, fake_cache, hub):
+        self.pull(runner, fake_cache, hub, "-y", f"{REPO}:UD-Q4_K_XL")
+
+        result = run(runner, fake_cache, "ls")
+
+        assert result.exit_code == EXIT_OK
+        assert REPO in result.output
+        assert ":UD-Q4_K_XL" in result.output
+
+    def test_names_the_directory_it_would_write_into(self, runner, fake_cache, hub):
+        result = self.pull(runner, fake_cache, hub, "-n", f"{REPO}:UD-Q4_K_XL")
+
+        assert str(fake_cache.root) in result.output

@@ -1,8 +1,8 @@
 """The command line.
 
 ``ls`` is the default command, so ``llama-cache-manager`` and
-``llama-cache-manager unsloth`` both list. Every command that deletes builds a
-plan, prints it, and asks before touching the disk.
+``llama-cache-manager unsloth`` both list. Every command that deletes or
+downloads builds a plan, prints it, and asks before touching the disk.
 """
 
 from __future__ import annotations
@@ -17,10 +17,11 @@ from pathlib import Path
 
 import click
 
-from . import age, display, refs, removal
+from . import age, display, download, refs, removal
 from . import cache as cache_model
 from .age import CutoffError
 from .cache import ArtifactTarget, CacheError, RepoTarget, ResolveError
+from .download import DownloadError, SelectionError
 from .refs import ReferenceError
 from .removal import RemovalError
 
@@ -66,6 +67,30 @@ def default_cache_dir() -> Path:
     if llama_default.is_dir():
         return llama_default
     return Path(HF_HUB_CACHE)
+
+
+def default_download_dir() -> Path:
+    """Where a download goes when ``--cache-dir`` is not given.
+
+    A writer has to agree with the reader, or ``pull`` would fetch into a
+    directory ``ls`` does not read and fetch the same file again on the next
+    run. So a cache that exists wins, exactly as it does for a listing.
+
+    The choice only matters on its own when there is no cache at all, and then
+    it falls to the llama.cpp location. That is the one ``llama-server -hf``
+    reads, and creating the hub cache instead would hide the model from the
+    program the download was for.
+    """
+    from_env = os.environ.get("LLAMA_CACHE")
+    if from_env:
+        return Path(from_env)
+    existing = default_cache_dir()
+    if existing.is_dir():
+        return existing
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        return Path(hf_home) / "llama.cpp"
+    return Path.home() / ".cache" / "llama.cpp"
 
 
 def fail(message: str, code: int = EXIT_ERROR) -> click.ClickException:
@@ -131,7 +156,7 @@ def _cache_dir_from(ctx) -> Path:
 @click.version_option(VERSION, "-V", "--version", prog_name="llama-cache-manager")
 @click.pass_context
 def main(ctx: click.Context, cache_dir: Path | None, color: str) -> None:
-    """Inspect and delete GGUF models in a llama.cpp or Hugging Face cache.
+    """Fetch, inspect and delete GGUF models in a llama.cpp or Hugging Face cache.
 
     Models are named the way huggingface.co and llama.cpp's -hf option name
     them, as org/repo:quant, for example
@@ -394,6 +419,98 @@ def _execute(plan) -> None:
         raise fail(str(error), EXIT_ERROR) from error
     except OSError as error:
         raise fail(f"could not finish the removal: {error}", EXIT_ERROR) from error
+
+
+@main.command("pull")
+@click.argument("references", nargs=-1, required=True)
+@click.option(
+    "--revision",
+    default="main",
+    show_default=True,
+    metavar="REV",
+    help="Branch, tag or commit to fetch.",
+)
+@click.option("-n", "--dry-run", is_flag=True, help="Show the plan and stop.")
+@click.option("-y", "--yes", is_flag=True, help="Do not ask.")
+@click.option("--json", "as_json", is_flag=True, help="Print the plan as JSON.")
+@click.pass_context
+def pull(ctx: click.Context, references, revision: str, dry_run: bool, yes: bool, as_json: bool) -> None:
+    """Fetch one quant of a repository from the hub into the cache.
+
+    REFERENCES are org/repo:quant. The quant has to be named, because the hub
+    cannot be searched from here and the quants of one repository differ by tens
+    of gigabytes. A reference without one comes back with the choices named.
+
+    A file the cache already holds is not fetched again, so pulling a second
+    quant of a model transfers only what is new.
+    """
+    target = _target_dir(ctx)
+    hub = _open_hub(ctx)
+    try:
+        plan = download.plan(hub, target, _parse_references(references), revision)
+    except SelectionError as error:
+        raise fail(str(error), EXIT_NO_MATCH) from error
+    except DownloadError as error:
+        raise fail(str(error), EXIT_ERROR) from error
+
+    if as_json:
+        # The same rule the removal commands follow: a document nobody watches
+        # cannot be answered, so the decision belongs on the command line.
+        if not dry_run and not yes:
+            raise fail("--json downloads nothing on its own: add -n to preview or -y to fetch", EXIT_USAGE)
+        json.dump(display.download_plan_as_json(plan, dry_run), sys.stdout, indent=2)
+        print()
+        if not dry_run:
+            _fetch(plan, hub)
+        return
+
+    style = _style(ctx)
+    display.render_download_plan(plan, style, dry_run, sys.stdout)
+    if dry_run:
+        return
+
+    # Nothing to transfer leaves nothing to weigh up. What such a run still
+    # does is add the links a snapshot is missing, which costs no bandwidth.
+    if plan.transfer and not yes:
+        print()
+        if not click.confirm("Download these?", default=False):
+            raise fail("cancelled", EXIT_CANCELLED)
+
+    _fetch(plan, hub)
+    # A run that transferred nothing needs no closing line: the summary above
+    # already said that everything was there.
+    if plan.transfer:
+        print()
+        print(style.paint(style.total, f"Fetched {display.human_size(plan.transfer)}."))
+
+
+def _target_dir(ctx: click.Context) -> Path:
+    """Where a download goes, which need not exist yet."""
+    given = ctx.obj.get("cache_dir")
+    path = Path(given) if given else default_download_dir()
+    if path.exists() and not path.is_dir():
+        raise fail(f"not a directory: {path}", EXIT_ERROR)
+    return path
+
+
+def _open_hub(ctx: click.Context):
+    """The hub to read, with the one a caller put in the context winning.
+
+    The tests put a fake there, which is what keeps them off the network.
+    """
+    existing = ctx.obj.get("hub")
+    if existing is not None:
+        return existing
+    from .hub import HubApi
+
+    return HubApi()
+
+
+def _fetch(plan, hub) -> None:
+    try:
+        download.execute(plan, hub)
+    except DownloadError as error:
+        raise fail(str(error), EXIT_ERROR) from error
 
 
 @main.command("help")
