@@ -189,6 +189,63 @@ holds part of the artifact.
 `name` is the path of the file inside the repository, which is what the hub
 calls it.
 
+## `update --json`
+
+Everything `pull --json` carries, plus what moved and what was left alone. With
+`-n` it is only printed, and without `-n` it needs `-y`.
+
+```json
+{
+  "schema": 1,
+  "dry_run": true,
+  "keep": false,
+  "cache_dir": "/srv/llama-models",
+  "size": 15869711974,
+  "transfer": 15869711974,
+  "updates": [
+    {
+      "repo_id": "unsloth/Qwen3.8-27B-GGUF",
+      "ref": "main",
+      "local_commit": "1a2b3c4d...",
+      "remote_commit": "9f8e7d6c...",
+      "quants": ["UD-Q4_K_XL", "mmproj-BF16"]
+    }
+  ],
+  "downloads": [ ... ],
+  "skipped": [
+    {
+      "repo_id": "unsloth/Old-30B-GGUF",
+      "ref": "main",
+      "reason": "unsloth/Old-30B-GGUF has no quant 'Q4_K_M' at revision 'main'; it offers Q5_K_M"
+    }
+  ]
+}
+```
+
+| Field | Type | Meaning |
+| ----- | ---- | ------- |
+| `keep` | boolean | whether `--keep` was given, so the replaced revisions stay |
+| `updates` | array | one entry per name that is behind the hub, and will be followed |
+| `downloads` | array | what that costs, the same entries `pull --json` prints |
+| `skipped` | array | names left alone, each with the reason: a quant that is gone, or a repository the hub will not serve |
+
+The other fields mean what they do for `pull --json`.
+
+### update
+
+| Field | Type | Meaning |
+| ----- | ---- | ------- |
+| `repo_id` | string | `org/repo` |
+| `ref` | string | the name being followed, such as `main` |
+| `local_commit` | string | what the cache holds now |
+| `remote_commit` | string | what the hub points the name at |
+| `quants` | array of string | the artifacts the cache holds, which are the ones fetched |
+
+An empty `updates` and an empty `downloads` mean everything is up to date.
+Nothing describes the removal that follows: what it reclaims depends on the
+files the download puts there, so it is only known afterwards. Read it from
+`ls --json` after the run, or pass `--keep` and use `prune -n --json`.
+
 ## Exit codes
 
 `--json` writes its document first and then exits with the usual code, so

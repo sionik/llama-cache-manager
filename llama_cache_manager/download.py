@@ -25,6 +25,16 @@ class DownloadError(Exception):
     """The hub cannot be reached, or refused what was asked of it."""
 
 
+class UnavailableError(DownloadError):
+    """The hub answered, and what was asked for is not there or not allowed.
+
+    Kept apart from a hub that did not answer at all. A run over the whole
+    cache steps over one repository it cannot have and carries on, but it must
+    not step over a network that is down: that would report every repository as
+    up to date when nothing was checked.
+    """
+
+
 class SelectionError(Exception):
     """A reference that names no artifact on the hub."""
 
@@ -51,6 +61,15 @@ class Hub(Protocol):
 
         Raises:
             DownloadError: the hub is unreachable, or holds no such repository.
+        """
+        ...
+
+    def head(self, repo_id: str, revision: str) -> str:
+        """The commit ``revision`` points at on the hub right now.
+
+        Raises:
+            DownloadError: the hub is unreachable, or holds no such repository
+                or revision.
         """
         ...
 

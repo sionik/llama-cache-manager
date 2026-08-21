@@ -19,6 +19,7 @@ import click
 
 from . import age, display, download, refs, removal
 from . import cache as cache_model
+from . import update as update_model
 from .age import CutoffError
 from .cache import ArtifactTarget, CacheError, RepoTarget, ResolveError
 from .download import DownloadError, SelectionError
@@ -127,6 +128,15 @@ def complete_reference(ctx, param, incomplete):
         quants = {artifact.quant for revision in repo.revisions for artifact in revision.artifacts}
         candidates.extend(f"{repo.repo_id}:{quant}" for quant in sorted(quants))
     return [item for item in candidates if item.lower().startswith(incomplete.lower())]
+
+
+def complete_repository(ctx, param, incomplete):
+    """Offer ``org/repo`` only, for a command that refuses a quant."""
+    try:
+        cache = cache_model.scan(_cache_dir_from(ctx))
+    except (CacheError, OSError):
+        return []
+    return [repo.repo_id for repo in cache.repos if repo.repo_id.lower().startswith(incomplete.lower())]
 
 
 def _cache_dir_from(ctx) -> Path:
@@ -482,6 +492,146 @@ def pull(ctx: click.Context, references, revision: str, dry_run: bool, yes: bool
     if plan.transfer:
         print()
         print(style.paint(style.total, f"Fetched {display.human_size(plan.transfer)}."))
+
+
+@main.command("update")
+@click.argument("references", nargs=-1, shell_complete=complete_repository)
+@click.option("--keep", is_flag=True, help="Keep the revisions an update replaces.")
+@click.option("-n", "--dry-run", is_flag=True, help="Show the plan and stop.")
+@click.option("-y", "--yes", is_flag=True, help="Do not ask.")
+@click.option("--json", "as_json", is_flag=True, help="Print the plan as JSON.")
+@click.pass_context
+def update(ctx: click.Context, references, keep: bool, dry_run: bool, yes: bool, as_json: bool) -> None:
+    """Fetch a newer revision of what the cache already holds.
+
+    With no REFERENCES every repository the cache follows is checked, otherwise
+    only the ones named. One request per name says whether there is anything to
+    do, so a check across the whole cache costs little.
+
+    What the cache holds decides what is fetched: the same quants, at the newer
+    commit. The revision each name pointed at before is then removed, because
+    nothing can reach it any more. With --keep it stays, and prune offers it
+    later.
+    """
+    cache = _open_cache(ctx)
+    repos = _repos_to_update(cache, _parse_references(references))
+    hub = _open_hub(ctx)
+
+    try:
+        found = update_model.check(hub, update_model.tracked(cache, repos))
+        plan = update_model.plan(hub, cache.path, found)
+    except DownloadError as error:
+        raise fail(str(error), EXIT_ERROR) from error
+
+    style = _style(ctx)
+    if as_json:
+        if not dry_run and not yes and not plan.empty:
+            raise fail("--json updates nothing on its own: add -n to preview or -y to update", EXIT_USAGE)
+        json.dump(display.update_plan_as_json(plan, dry_run, keep), sys.stdout, indent=2)
+        print()
+        if not dry_run and not plan.empty:
+            _carry_out_update(ctx, plan, hub, keep, style, quiet=True)
+        return
+
+    for line in display.skipped_lines(plan.skipped):
+        print(style.paint(style.stray, line))
+    checked = display.count(len(repos), "repository", "repositories")
+    if plan.empty:
+        nothing = "Nothing can be updated." if plan.skipped else "Everything is up to date."
+        print(style.paint(style.dim, f"{nothing} {checked} checked."))
+        return
+
+    # Said before the list, so that a single line of output is not mistaken for
+    # a check that never ran. Counted in repositories, the same unit as the
+    # number it sits beside.
+    print(style.paint(style.dim, f"{checked} checked, {len(plan.repo_ids)} to update."))
+    print()
+    display.render_outdated(plan.replaced, style, sys.stdout)
+    print()
+    display.render_download_plan(plan.downloads, style, dry_run, sys.stdout)
+    if not keep:
+        print(
+            style.paint(
+                style.dim,
+                f"Then removes {display.count(plan.replaced_revisions, 'superseded revision')}.",
+            )
+        )
+    if dry_run:
+        return
+
+    # Asked even when nothing has to be transferred, because an update removes
+    # as well, and a file dropped upstream leaves the old revision holding a
+    # blob that nothing else does.
+    if not yes:
+        print()
+        if not click.confirm("Update these?", default=False):
+            raise fail("cancelled", EXIT_CANCELLED)
+
+    _carry_out_update(ctx, plan, hub, keep, style, quiet=False)
+
+
+def _repos_to_update(cache, references):
+    """The repositories an update should look at.
+
+    A quant is refused rather than obeyed. Fetching one quant of a repository
+    moves the name to the new revision, which leaves every other quant behind
+    in a revision the update would then remove.
+    """
+    named = [reference for reference in references if reference.quant is not None]
+    if named:
+        which = ", ".join(reference.raw for reference in named)
+        raise fail(
+            f"update works on whole repositories, so it cannot take a quant: {which}. "
+            "Write org/repo to update everything the cache holds of it.",
+            EXIT_USAGE,
+        )
+    if not references:
+        return list(cache.repos)
+
+    chosen: dict[str, object] = {}
+    for reference in references:
+        found = cache_model.repos_matching(cache, reference)
+        if not found:
+            raise fail(f"nothing in the cache matches {reference.raw!r}", EXIT_NO_MATCH)
+        for repo in found:
+            chosen[repo.repo_id] = repo
+    return list(chosen.values())
+
+
+def _carry_out_update(ctx, plan, hub, keep: bool, style, quiet: bool) -> None:
+    """Fetch the newer revisions, then drop the ones they replaced."""
+    _fetch(plan.downloads, hub)
+    if not quiet and plan.downloads.transfer:
+        print()
+        print(style.paint(style.total, f"Fetched {display.human_size(plan.downloads.transfer)}."))
+    if keep:
+        if not quiet:
+            print(style.paint(style.dim, "The replaced revisions are kept, and prune will offer them."))
+        return
+
+    # Scanned again on purpose. What the removal gives back depends on the files
+    # that have just arrived: a blob the new revision points at as well stays.
+    fresh = _open_cache(ctx)
+    try:
+        removal_plan = removal.build(fresh, update_model.superseded(fresh, list(plan.replaced)))
+    except RemovalError as error:
+        raise fail(str(error), EXIT_ERROR) from error
+    if removal_plan.empty:
+        return
+
+    if not quiet:
+        print()
+        display.render_plan(
+            removal_plan,
+            time.time(),
+            style,
+            False,
+            sys.stdout,
+            heading="Removing what the update replaced",
+        )
+    _execute(removal_plan)
+    if not quiet and removal_plan.freed:
+        print(style.paint(style.total, f"Removed {display.human_size(removal_plan.freed)}."))
 
 
 def _target_dir(ctx: click.Context) -> Path:

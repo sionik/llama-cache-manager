@@ -264,9 +264,16 @@ def _garbage_hint(garbage: Plan) -> str:
     return f"prune would remove {', '.join(parts)}, reclaiming {reclaims}"
 
 
-def render_plan(plan: Plan, now: float, style: Style, dry_run: bool, out: TextIO) -> None:
-    """Print what a plan would remove, grouped the way ``ls`` groups."""
-    heading = "Would remove" if dry_run else "About to remove"
+def render_plan(
+    plan: Plan, now: float, style: Style, dry_run: bool, out: TextIO, heading: str | None = None
+) -> None:
+    """Print what a plan would remove, grouped the way ``ls`` groups.
+
+    ``heading`` replaces the default line for a caller whose removal was
+    already agreed to, such as the one an update makes after its download.
+    """
+    if heading is None:
+        heading = "Would remove" if dry_run else "About to remove"
     print(style.paint(style.repo, heading), file=out)
     print(file=out)
 
@@ -521,3 +528,43 @@ def download_plan_as_json(plan: DownloadPlan, dry_run: bool) -> dict:
             for item in plan.downloads
         ],
     }
+
+
+def render_outdated(items, style: Style, out: TextIO) -> None:
+    """One line per name the hub has moved, old commit to new."""
+    layout = Layout.measure([item.repo_id for item in items], [], [])
+    width = max((len(item.name) for item in items), default=0)
+    for item in items:
+        print(
+            f"{style.paint(style.repo, item.repo_id.ljust(layout.repo))}"
+            f"  {style.paint(style.dim, item.name.ljust(width))}"
+            f"  {style.paint(style.revision, item.local_commit[:7])}"
+            f" {style.paint(style.dim, '->')} "
+            f"{style.paint(style.revision, item.remote_commit[:7])}",
+            file=out,
+        )
+
+
+def skipped_lines(skipped) -> list[str]:
+    """Why a repository was left out of an update."""
+    return [f"left alone, {item.reason}" for item in skipped]
+
+
+def update_plan_as_json(plan, dry_run: bool, keep: bool) -> dict:
+    """An update as data: what moved, what it fetches, what it leaves alone."""
+    document = download_plan_as_json(plan.downloads, dry_run)
+    document["keep"] = keep
+    document["updates"] = [
+        {
+            "repo_id": item.repo_id,
+            "ref": item.name,
+            "local_commit": item.local_commit,
+            "remote_commit": item.remote_commit,
+            "quants": list(item.quants),
+        }
+        for item in plan.replaced
+    ]
+    document["skipped"] = [
+        {"repo_id": item.repo_id, "ref": item.name, "reason": item.reason} for item in plan.skipped
+    ]
+    return document

@@ -656,3 +656,246 @@ class TestPull:
         result = self.pull(runner, fake_cache, hub, "-n", f"{REPO}:UD-Q4_K_XL")
 
         assert str(fake_cache.root) in result.output
+
+
+class TestUpdate:
+    """Following the hub, with the hub faked out."""
+
+    LOCAL = {"Foo-30B-Q4_K_M.gguf": 500, "mmproj-Foo-30B-BF16.gguf": 70}
+    REMOTE = {"Foo-30B-Q4_K_M.gguf": 600, "mmproj-Foo-30B-BF16.gguf": 70}
+
+    @pytest.fixture
+    def stale(self, fake_cache):
+        fake_cache.revision(REPO, COMMIT_A, dict(self.LOCAL))
+        return fake_cache
+
+    @pytest.fixture
+    def hub(self, stale):
+        return FakeHub({REPO: {"commit": COMMIT_B, "files": dict(self.REMOTE)}}, cache=stale)
+
+    def update(self, runner, cache, hub, *args, **kwargs):
+        return runner.invoke(
+            main,
+            ["-c", str(cache.root), "--color", "never", "update", *args],
+            obj={"hub": hub},
+            **kwargs,
+        )
+
+    def commits(self, cache):
+        from llama_cache_manager.cache import scan
+
+        return {
+            revision.commit: revision.names for repo in scan(cache.root).repos for revision in repo.revisions
+        }
+
+    def test_says_so_when_everything_is_up_to_date(self, runner, stale):
+        hub = FakeHub({REPO: {"commit": COMMIT_A, "files": dict(self.LOCAL)}}, cache=stale)
+
+        result = self.update(runner, stale, hub)
+
+        assert result.exit_code == EXIT_OK
+        assert "up to date" in result.output
+        assert hub.fetched == []
+
+    def test_shows_the_commit_it_would_move_to(self, runner, stale, hub):
+        result = self.update(runner, stale, hub, "-n")
+
+        assert result.exit_code == EXIT_OK
+        assert f"{COMMIT_A[:7]} -> {COMMIT_B[:7]}" in result.output
+        assert hub.fetched == []
+
+    def test_fetches_the_quants_the_cache_already_holds(self, runner, stale, hub):
+        result = self.update(runner, stale, hub, input="y\n")
+
+        assert result.exit_code == EXIT_OK
+        assert sorted(name for _, name in hub.fetched) == sorted(self.REMOTE)
+
+    def test_removes_the_revision_it_replaced(self, runner, stale, hub):
+        self.update(runner, stale, hub, "-y")
+
+        assert self.commits(stale) == {COMMIT_B: ("main",)}
+
+    def test_reports_what_the_removal_reclaimed(self, runner, stale, hub):
+        result = self.update(runner, stale, hub, "-y")
+
+        # The old revision held 500 and 70 bytes in blobs of its own.
+        assert "Removed 570 B." in result.output
+
+    def test_keeps_the_replaced_revision_when_asked(self, runner, stale, hub):
+        result = self.update(runner, stale, hub, "--keep", "-y")
+
+        assert result.exit_code == EXIT_OK
+        assert self.commits(stale) == {COMMIT_A: (), COMMIT_B: ("main",)}
+        assert "prune" in result.output
+
+    def test_changes_nothing_when_the_answer_is_no(self, runner, stale, hub):
+        result = self.update(runner, stale, hub, input="n\n")
+
+        assert result.exit_code == EXIT_CANCELLED
+        assert hub.fetched == []
+        assert self.commits(stale) == {COMMIT_A: ("main",)}
+
+    def test_refuses_a_quant_because_it_would_orphan_the_others(self, runner, stale, hub):
+        result = self.update(runner, stale, hub, f"{REPO}:Q4_K_M")
+
+        assert result.exit_code == EXIT_USAGE
+        assert "whole repositories" in result.output
+        assert hub.fetched == []
+
+    def test_reports_a_reference_the_cache_does_not_hold(self, runner, stale, hub):
+        result = self.update(runner, stale, hub, "nothing-like-this")
+
+        assert result.exit_code == EXIT_NO_MATCH
+        assert hub.fetched == []
+
+    def test_looks_only_at_the_repositories_named(self, runner, fake_cache):
+        fake_cache.revision(REPO, COMMIT_A, dict(self.LOCAL))
+        fake_cache.revision("other/Bar-GGUF", COMMIT_A, {"Bar-Q8_0.gguf": 90})
+        hub = FakeHub(
+            {
+                REPO: {"commit": COMMIT_B, "files": dict(self.REMOTE)},
+                "other/Bar-GGUF": {"commit": COMMIT_B, "files": {"Bar-Q8_0.gguf": 95}},
+            },
+            cache=fake_cache,
+        )
+
+        self.update(runner, fake_cache, hub, "other", "-y")
+
+        assert {repo_id for repo_id, _ in hub.fetched} == {"other/Bar-GGUF"}
+
+    def test_leaves_a_repository_whose_quant_is_gone_alone(self, runner, stale):
+        hub = FakeHub({REPO: {"commit": COMMIT_B, "files": {"Foo-30B-Q4_K_M.gguf": 600}}}, cache=stale)
+
+        result = self.update(runner, stale, hub, "-y")
+
+        assert result.exit_code == EXIT_OK
+        assert "left alone" in result.output
+        assert hub.fetched == []
+        assert self.commits(stale) == {COMMIT_A: ("main",)}
+
+    def test_leaves_a_repository_holding_no_gguf_file_alone(self, runner, fake_cache):
+        # The hub cache is a shared directory, so it holds repositories this
+        # tool never downloaded. An update fetches nothing for them, and must
+        # therefore remove nothing of them either.
+        fake_cache.revision(REPO, COMMIT_A, dict(self.LOCAL))
+        fake_cache.revision("meta/Text-Model", COMMIT_A, {"config.json": 10})
+        hub = FakeHub(
+            {
+                REPO: {"commit": COMMIT_B, "files": dict(self.REMOTE)},
+                "meta/Text-Model": {"commit": COMMIT_B, "files": {"config.json": 11}},
+            },
+            cache=fake_cache,
+        )
+
+        result = self.update(runner, fake_cache, hub, "-y")
+
+        assert result.exit_code == EXIT_OK
+        assert (fake_cache.repo_path("meta/Text-Model") / "refs" / "main").read_text() == COMMIT_A
+        assert hub.heads == [(REPO, "main")]
+
+    def test_keeps_a_revision_a_tag_still_points_at(self, runner, fake_cache):
+        fake_cache.revision(REPO, COMMIT_A, dict(self.LOCAL))
+        fake_cache.ref(REPO, COMMIT_A, "v1.0")
+
+        class OnlyMainMoved(FakeHub):
+            def head(self, repo_id, revision):
+                self.heads.append((repo_id, revision))
+                return COMMIT_B if revision == "main" else COMMIT_A
+
+        hub = OnlyMainMoved({REPO: {"commit": COMMIT_B, "files": dict(self.REMOTE)}}, cache=fake_cache)
+
+        result = self.update(runner, fake_cache, hub, "-y")
+
+        assert result.exit_code == EXIT_OK
+        assert (fake_cache.repo_path(REPO) / "refs" / "v1.0").read_text() == COMMIT_A
+        assert self.commits(fake_cache) == {COMMIT_A: ("v1.0",), COMMIT_B: ("main",)}
+
+    def test_updates_the_rest_when_one_repository_cannot_be_had(self, runner, fake_cache):
+        # A repository that went private, was taken down, or wants a licence
+        # nobody accepted must not stop the whole cache from updating.
+        from llama_cache_manager.download import UnavailableError
+
+        fake_cache.revision(REPO, COMMIT_A, dict(self.LOCAL))
+        fake_cache.revision("private/Gone-GGUF", COMMIT_A, {"Gone-Q4_K_M.gguf": 100})
+
+        class Refusing(FakeHub):
+            def head(self, repo_id, revision):
+                if repo_id == "private/Gone-GGUF":
+                    raise UnavailableError(f"the hub has no {repo_id}, or it is private")
+                return super().head(repo_id, revision)
+
+        hub = Refusing({REPO: {"commit": COMMIT_B, "files": dict(self.REMOTE)}}, cache=fake_cache)
+
+        result = self.update(runner, fake_cache, hub, "-y")
+
+        assert result.exit_code == EXIT_OK
+        assert "left alone" in result.output
+        assert {repo_id for repo_id, _ in hub.fetched} == {REPO}
+        assert (fake_cache.repo_path("private/Gone-GGUF") / "refs" / "main").exists()
+
+    def test_stops_when_the_hub_cannot_be_reached(self, runner, stale, hub):
+        # Not one repository refusing, but no answers at all. Reporting the
+        # cache as up to date would be a lie.
+        hub.reachable = False
+
+        result = self.update(runner, stale, hub)
+
+        assert result.exit_code == EXIT_ERROR
+        assert self.commits(stale) == {COMMIT_A: ("main",)}
+
+    def test_prints_the_plan_as_json(self, runner, stale, hub):
+        result = self.update(runner, stale, hub, "--json", "-n")
+
+        assert result.exit_code == EXIT_OK
+        report = json.loads(result.output)
+        assert report["updates"][0]["local_commit"] == COMMIT_A
+        assert report["updates"][0]["remote_commit"] == COMMIT_B
+        assert sorted(report["updates"][0]["quants"]) == ["Q4_K_M", "mmproj-BF16"]
+        assert report["keep"] is False
+        assert hub.fetched == []
+
+    def test_refuses_a_json_run_that_neither_previews_nor_agrees(self, runner, stale, hub):
+        result = self.update(runner, stale, hub, "--json")
+
+        assert result.exit_code == EXIT_USAGE
+        assert hub.fetched == []
+
+
+class TestUpdateCompletion:
+    def test_offers_repositories_but_not_quants(self, filled_cache, monkeypatch):
+        # update refuses a quant, so completing one would offer a word it then
+        # rejects.
+        import click
+
+        from llama_cache_manager.cli import complete_repository
+
+        monkeypatch.setenv("LLAMA_CACHE", str(filled_cache.root))
+        with click.Context(main) as ctx:
+            offered = complete_repository(ctx, None, "")
+
+        assert REPO in offered
+        assert all(":" not in item for item in offered)
+
+
+class TestUpdateCounts:
+    """The preview counts what it says it counts.
+
+    A repository can follow two names that point at the same commit. Moving
+    both leaves one revision behind, and the line the user agrees to has to say
+    one.
+    """
+
+    def test_counts_repositories_and_revisions_not_names(self, runner, fake_cache):
+        fake_cache.revision(REPO, COMMIT_A, {"Foo-30B-Q4_K_M.gguf": 500})
+        fake_cache.ref(REPO, COMMIT_A, "v1.0")
+        hub = FakeHub({REPO: {"commit": COMMIT_B, "files": {"Foo-30B-Q4_K_M.gguf": 600}}}, cache=fake_cache)
+
+        result = runner.invoke(
+            main,
+            ["-c", str(fake_cache.root), "--color", "never", "update", "-n"],
+            obj={"hub": hub},
+        )
+
+        assert result.exit_code == EXIT_OK
+        assert "1 repository checked, 1 to update." in result.output
+        assert "Then removes 1 superseded revision." in result.output

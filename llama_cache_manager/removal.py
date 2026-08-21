@@ -34,6 +34,7 @@ class Reason(Enum):
     REPOSITORY = "repository"
     DETACHED = "detached revision"
     AGED = "revision older than the cutoff"
+    SUPERSEDED = "revision replaced by an update"
     STRAY = "unreferenced blob"
     INCOMPLETE = "interrupted download"
 

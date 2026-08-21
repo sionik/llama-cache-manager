@@ -103,6 +103,66 @@ llama-cache-manager pull -y unsloth/Qwen3.8-27B-GGUF:mmproj-BF16  do not ask
 A gated or private repository needs a token, which `huggingface_hub` reads from
 `HF_TOKEN` or from the file `hf auth login` writes.
 
+## Updating
+
+`update` asks the hub what each name in the cache points at now, and fetches a
+newer revision of what the cache already holds:
+
+```text
+$ llama-cache-manager update
+5 repositories checked, 1 to update.
+
+unsloth/Qwen3.8-27B-GGUF  main  1a2b3c4 -> 9f8e7d6
+
+About to download into /home/simon/.cache/llama.cpp
+
+unsloth/Qwen3.8-27B-GGUF  main  9f8e7d6
+  :UD-Q4_K_XL    14.8 GiB  2 shards
+  :mmproj-BF16    1.9 GiB
+
+Transfers 16.7 GiB
+2 artifacts, 3 files
+Then removes 1 superseded revision.
+
+Update these? [y/N]:
+```
+
+The check costs one request per name, so running it over the whole cache is
+cheap. What the cache holds decides what is fetched: the same quants, at the
+newer commit.
+
+Fetching moves `refs/main` to the new revision, which leaves the old one with
+no name pointing at it. That revision is what an update removes, and nothing
+else. A revision that was already detached, a stray blob or an interrupted
+download were not made by this run, and `prune` is the command for those. A
+revision a second name still reaches, such as a tag fetched at the same commit,
+stays as well.
+
+```text
+llama-cache-manager update -n                 what has an update, and what it costs
+llama-cache-manager update unsloth            only one org
+llama-cache-manager update --keep             leave the old revisions for prune
+llama-cache-manager update -y                 do not ask
+```
+
+`update` takes repositories, not quants. Fetching one quant would move the name
+to the new revision and leave every other quant behind in the revision the
+update then removes, so a `:quant` is refused rather than obeyed.
+
+A repository the update cannot follow is left alone with a reason, and the
+others still update: one that no longer offers a quant the cache holds, and one
+the hub will not serve at all because it was taken down, went private, or wants
+a licence nobody accepted. A hub that gives no answer stops the run instead,
+because calling a cache up to date when nothing was checked would be a lie.
+
+A revision that a second name still points at, such as a tag fetched at the
+same commit, is kept. The update moves the name it followed, and a revision
+something can still reach is not one the update made unreachable.
+
+Repositories the cache holds without a GGUF file are passed over. The hub cache
+is a shared directory, so it holds models this tool never downloaded, and an
+update that fetches nothing for them must remove nothing of them either.
+
 ## Removing
 
 Every command that deletes prints the plan first, then asks. `--dry-run` prints

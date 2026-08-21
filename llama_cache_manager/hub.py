@@ -13,7 +13,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from .download import DownloadError, FileStatus
+from .download import DownloadError, FileStatus, UnavailableError
 
 
 class HubApi:
@@ -31,6 +31,10 @@ class HubApi:
     def file_names(self, repo_id: str, revision: str) -> tuple[str, ...]:
         with _translated(repo_id, revision):
             return tuple(self._api.list_repo_files(repo_id, revision=revision))
+
+    def head(self, repo_id: str, revision: str) -> str:
+        with _translated(repo_id, revision):
+            return self._api.repo_info(repo_id, revision=revision).sha
 
     def inspect(self, repo_id: str, name: str, revision: str, cache_dir: Path) -> FileStatus:
         from huggingface_hub import hf_hub_download
@@ -62,7 +66,13 @@ class HubApi:
 
 @contextmanager
 def _translated(what: str, revision: str) -> Iterator[None]:
-    """Turn a library failure into a ``DownloadError`` naming ``what``."""
+    """Turn a library failure into a ``DownloadError`` naming ``what``.
+
+    An answer the user cannot use becomes an :class:`UnavailableError`, and a
+    missing answer stays a plain :class:`DownloadError`, so that a caller
+    working through a whole cache can tell one repository it cannot have from a
+    hub it cannot reach.
+    """
     from huggingface_hub.errors import (
         DisabledRepoError,
         EntryNotFoundError,
@@ -77,17 +87,17 @@ def _translated(what: str, revision: str) -> Iterator[None]:
     try:
         yield
     except GatedRepoError as error:
-        raise DownloadError(
+        raise UnavailableError(
             f"{what} is gated: accept its licence on huggingface.co and log in with 'hf auth login'"
         ) from error
     except DisabledRepoError as error:
-        raise DownloadError(f"{what} has been disabled on the hub") from error
+        raise UnavailableError(f"{what} has been disabled on the hub") from error
     except RepositoryNotFoundError as error:
-        raise DownloadError(
+        raise UnavailableError(
             f"the hub has no {what}, or it is private and the token does not reach it"
         ) from error
     except RevisionNotFoundError as error:
-        raise DownloadError(f"the hub has no revision {revision!r} of {what}") from error
+        raise UnavailableError(f"the hub has no revision {revision!r} of {what}") from error
     except LocalEntryNotFoundError as error:
         # Offline, or the hub did not answer. This clause has to come before the
         # one below: the library derives this error from EntryNotFoundError, so a
@@ -96,11 +106,16 @@ def _translated(what: str, revision: str) -> Iterator[None]:
         # first line is kept.
         raise DownloadError(f"cannot reach the hub for {what}: {_first_line(error)}") from error
     except EntryNotFoundError as error:
-        raise DownloadError(f"the hub has no file {what}") from error
+        raise UnavailableError(f"the hub has no file {what}") from error
     except HFValidationError as error:
-        raise DownloadError(f"the hub cannot be asked for {what}: {error}") from error
+        raise UnavailableError(f"the hub cannot be asked for {what}: {error}") from error
     except HfHubHTTPError as error:
         raise DownloadError(f"the hub refused {what}: {_first_line(error)}") from error
+    except (ConnectionError, TimeoutError) as error:
+        # Both of these are an OSError, so they have to be caught before the
+        # clause below. A connection that failed wrote nothing, and saying it
+        # could not write would send the reader to look at the disk.
+        raise DownloadError(f"cannot reach the hub for {what}: {_first_line(error)}") from error
     except OSError as error:
         raise DownloadError(f"could not write {what} into the cache: {error}") from error
 

@@ -14,11 +14,12 @@ from huggingface_hub.errors import (
     HfHubHTTPError,
     HFValidationError,
     LocalEntryNotFoundError,
+    OfflineModeIsEnabled,
     RepositoryNotFoundError,
     RevisionNotFoundError,
 )
 
-from llama_cache_manager.download import DownloadError
+from llama_cache_manager.download import DownloadError, UnavailableError
 from llama_cache_manager.hub import _translated
 
 WHAT = "unsloth/Foo-30B-GGUF/Foo-30B-Q4_K_M.gguf"
@@ -104,3 +105,69 @@ def test_names_what_failed_in_every_message():
     ]
 
     assert all(WHAT in raising(error) for error in errors)
+
+
+def raised_by(error: Exception) -> type:
+    with pytest.raises(DownloadError) as caught, _translated(WHAT, "main"):
+        raise error
+    return type(caught.value)
+
+
+class TestWhoIsToBlame:
+    """A run over the whole cache steps over one repository it cannot have.
+
+    It must not step over a network that is down, because that would report
+    every repository as fine. So the two cases are separate classes.
+    """
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            RepositoryNotFoundError("gone", response=Response()),
+            RevisionNotFoundError("gone", response=Response()),
+            EntryNotFoundError("gone"),
+            GatedRepoError("gated", response=Response()),
+            HFValidationError("bad repo id"),
+        ],
+        ids=["repository", "revision", "file", "gated", "invalid"],
+    )
+    def test_calls_an_answer_the_user_cannot_use_unavailable(self, error):
+        assert raised_by(error) is UnavailableError
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            LocalEntryNotFoundError("offline"),
+            HfHubHTTPError("too many requests", response=Response()),
+            PermissionError("read-only file system"),
+        ],
+        ids=["offline", "refused", "unwritable"],
+    )
+    def test_leaves_a_missing_answer_as_a_plain_failure(self, error):
+        assert raised_by(error) is DownloadError
+
+
+class TestWhatFailed:
+    """A network failure must not be reported as a write failure.
+
+    Both arrive as an OSError, because a connection error is one, so the
+    clause order decides which message the user reads.
+    """
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            OfflineModeIsEnabled("offline mode is enabled"),
+            ConnectionError("connection reset by peer"),
+            TimeoutError("timed out"),
+        ],
+        ids=["offline", "reset", "timeout"],
+    )
+    def test_calls_a_connection_failure_unreachable(self, error):
+        message = raising(error)
+
+        assert "cannot reach the hub" in message
+        assert "write" not in message
+
+    def test_still_reports_a_cache_it_cannot_write(self):
+        assert "into the cache" in raising(PermissionError("read-only file system"))

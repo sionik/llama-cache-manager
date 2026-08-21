@@ -20,6 +20,10 @@ llama\-cache\-manager \- fetch, inspect and delete GGUF models in a llama.cpp or
 .B llama\-cache\-manager pull
 .RI [ options ]
 .IR org / repo : quant .\|.\|.
+.br
+.B llama\-cache\-manager update
+.RI [ options ]
+.RI [ org / repo .\|.\|.]
 .SH DESCRIPTION
 .B llama\-cache\-manager
 reads a model cache in the Hugging Face layout, the one llama.cpp fills when it
@@ -42,6 +46,9 @@ counts only when every entry pointing at it is going away, so deleting a file
 that another revision still uses reports that it reclaims nothing. What a
 download plan calls a transfer is what has to come over the network, which is
 less than the size of the artifact whenever the cache already holds part of it.
+An update shows both halves before it starts, and prints what the removal
+reclaimed once the new files are there, because a blob the new revision points
+at as well is not freed by dropping the old one.
 .SH REFERENCES
 A reference has a repository part and an optional quant part.
 .TP
@@ -205,6 +212,53 @@ Do not ask.
 .TP
 .B \-\-json
 Print the plan as data. Fetching then needs
+.BR \-y ,
+because nobody is there to answer a prompt.
+.SS update [options] [org/repo .\|.\|.]
+Fetch a newer revision of what the cache already holds. With no arguments every
+repository the cache follows is checked, otherwise only the ones named. The
+check costs one request per name, so running it over the whole cache is cheap.
+.PP
+What the cache holds decides what is fetched: the same quants, at the newer
+commit. Fetching moves the name to the new revision, which leaves the old one
+with nothing pointing at it, and that revision is what an update removes.
+Nothing else goes: a revision that was already detached, a stray blob or an
+interrupted download were not made by this run, and
+.B prune
+is the command for those. A revision a second name still reaches, such as a tag
+fetched at the same commit, stays as well.
+.PP
+An update takes repositories, not quants. Fetching one quant would move the
+name and leave every other quant behind in the revision the update then
+removes, so a
+.BI : quant
+is refused rather than obeyed.
+.PP
+A repository the update cannot follow is left alone with a reason, and the
+others still update: one that no longer offers a quant the cache holds, and one
+the hub will not serve at all, because it was taken down, went private, or
+wants a licence nobody accepted. A hub that gives no answer stops the run
+instead, because calling a cache up to date when nothing was checked would be a
+lie.
+.PP
+A revision a second name still points at, such as a tag fetched at the same
+commit, is kept. Repositories the cache holds without a GGUF file are passed
+over: the hub cache is a shared directory, and an update that fetches nothing
+for such a repository removes nothing of it either.
+.TP
+.B \-\-keep
+Keep the revisions the update replaces. They are detached afterwards, so
+.B prune
+will offer them.
+.TP
+.BR \-n ", " \-\-dry\-run
+Print the plan and stop.
+.TP
+.BR \-y ", " \-\-yes
+Do not ask.
+.TP
+.B \-\-json
+Print the plan as data. Updating then needs
 .BR \-y ,
 because nobody is there to answer a prompt.
 .SS completions {bash|zsh|fish}
@@ -371,6 +425,22 @@ Fetch a model and its projector in one go:
 .EX
 llama\-cache\-manager pull unsloth/Qwen3.8\-27B\-GGUF:UD\-Q4_K_XL \\
     unsloth/Qwen3.8\-27B\-GGUF:mmproj\-BF16
+.EE
+.RE
+.PP
+See what has an update, and what following it would cost:
+.PP
+.RS
+.EX
+llama\-cache\-manager update \-n
+.EE
+.RE
+.PP
+Follow one organisation, keeping the old revisions for now:
+.PP
+.RS
+.EX
+llama\-cache\-manager update \-\-keep unsloth
 .EE
 .RE
 .PP

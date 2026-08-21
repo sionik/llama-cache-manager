@@ -86,6 +86,7 @@ class FakeHub:
         self.cached = set(cached)
         self.fetched: list[tuple[str, str]] = []
         self.listed: list[str] = []
+        self.heads: list[tuple[str, str]] = []
         self.reachable = True
 
     def _repo(self, repo_id: str, revision: str) -> dict:
@@ -101,6 +102,11 @@ class FakeHub:
         files = self._repo(repo_id, revision)["files"]
         self.listed.append(repo_id)
         return tuple(files)
+
+    def head(self, repo_id: str, revision: str) -> str:
+        commit = self._repo(repo_id, revision)["commit"]
+        self.heads.append((repo_id, revision))
+        return commit
 
     def inspect(self, repo_id: str, name: str, revision: str, cache_dir: Path):
         from llama_cache_manager.download import FileStatus
