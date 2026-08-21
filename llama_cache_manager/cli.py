@@ -26,7 +26,7 @@ from .download import DownloadError, SelectionError
 from .refs import ReferenceError
 from .removal import RemovalError
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 EXIT_OK = 0
 EXIT_ERROR = 1
