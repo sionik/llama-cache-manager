@@ -252,6 +252,11 @@ def scan(cache_dir: Path) -> Cache:
             )
         )
 
+    # The hub stops after the first symlink hop of a snapshot entry, while a
+    # walk of ``blobs`` sees the directory's own spelling. A symlink above
+    # the blob gives one file both names, so only resolved paths compare.
+    referenced = {_resolve(path) for path in references}
+
     repos = []
     for hub_repo in report.repos:
         revisions = tuple(
@@ -265,7 +270,7 @@ def scan(cache_dir: Path) -> Cache:
                 repo_id=hub_repo.repo_id,
                 path=hub_repo.repo_path,
                 revisions=revisions,
-                strays=_strays_of(hub_repo.repo_path, references),
+                strays=_strays_of(hub_repo.repo_path, referenced),
                 incomplete=tuple(incomplete_by_repo.get(hub_repo.repo_path, ())),
                 accessed=hub_repo.last_accessed,
             )
@@ -327,7 +332,7 @@ def _artifact(quant: str, entries: tuple[Path, ...], blobs: tuple[Blob, ...]) ->
     return Artifact(quant=quant, kind=kind_of(quant), entries=entries, blobs=blobs)
 
 
-def _strays_of(repo_path: Path, references: Counter[Path]) -> tuple[Blob, ...]:
+def _strays_of(repo_path: Path, referenced: set[Path]) -> tuple[Blob, ...]:
     """Blobs in ``repo_path`` that no revision points at.
 
     Interrupted downloads are left out, because they are reported on their own
@@ -341,11 +346,8 @@ def _strays_of(repo_path: Path, references: Counter[Path]) -> tuple[Blob, ...]:
     for candidate in sorted(blobs_dir.iterdir()):
         if not candidate.is_file() or candidate.name.endswith(INCOMPLETE_SUFFIX):
             continue
-        # The hub reports every blob as file_path.resolve(), so a symlink
-        # anywhere above the blob gives the same file two spellings. Comparing
-        # the unresolved one would call a live blob unreferenced.
         resolved = _resolve(candidate)
-        if references[resolved] > 0:
+        if resolved in referenced:
             continue
         stats = _stat(resolved)
         if stats is None:
